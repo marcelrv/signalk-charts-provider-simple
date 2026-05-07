@@ -3,13 +3,10 @@ import type { Request, Response, IRouter } from 'express';
 import type { MBTilesReader } from './utils/mbtiles-reader';
 
 // ---- Plugin Configuration ----
+// Runtime-validated via TypeBox in `utils/plugin-config-schema.ts`.
+// Re-exported here so existing imports (`from './types'`) keep working.
 
-export type CpuBudgetPreset = 'single-core' | 'half' | 'all';
-
-export interface PluginConfig {
-  chartPath: string;
-  cpuBudget?: CpuBudgetPreset;
-}
+export type { CpuBudgetPreset, PluginConfig } from './utils/plugin-config-schema';
 
 // ---- Extended ServerAPI ----
 // ServerAPI from @signalk/server-api does not expose app.config or app.get() for route registration.
