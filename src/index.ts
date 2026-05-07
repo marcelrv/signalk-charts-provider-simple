@@ -43,6 +43,7 @@ import {
 import { processGshhg, processShpBasemap } from './utils/s57-converter';
 import { getCpuBudget, setCpuBudget } from './utils/concurrency';
 import { writeChartPathMarker } from './utils/path-marker';
+import { parsePluginConfig } from './utils/plugin-config-schema';
 
 // Read at module load so the marker file always reflects the running build.
 // `require` keeps this synchronous and avoids dragging package.json into the
@@ -111,10 +112,21 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
     }),
     uiSchema: () => ({}),
     start: (settings) => {
+      // Validate the saved config against the TypeBox schema before doing
+      // anything with it. Bad shapes show up as a clear plugin error in
+      // the admin UI instead of crashing several frames into doStartup.
+      let config: PluginConfig;
+      try {
+        config = parsePluginConfig(settings);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        app.setPluginError(msg);
+        return;
+      }
       // Signal K does not await start(); run async init in a self-contained
       // promise that handles its own errors so a setPluginError surfaces
       // anything we couldn't recover from (e.g. signalk-container missing).
-      doStartup(settings as PluginConfig).catch((err: unknown) => {
+      doStartup(config).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         app.setPluginError(`Startup failed: ${msg}`);
       });
