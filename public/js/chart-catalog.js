@@ -221,7 +221,7 @@ function renderCatalogCard(catalog) {
         </div>
       </div>
       <div class="catalog-card-body" id="catalog-body-${escapeId(catalog.file)}">
-        ${isExpanded && catalogChartData[catalog.file] ? renderChartList(catalog.file) : ''}
+        ${isExpanded && catalogChartData[catalog.file] ? renderChartList(catalog.file, catalog.label) : ''}
       </div>
     </div>
   `;
@@ -269,11 +269,12 @@ window.toggleCatalog = async function (catalogFile) {
   renderCatalogList();
 };
 
-function renderChartList(catalogFile) {
+function renderChartList(catalogFile, catalogLabel) {
   const data = catalogChartData[catalogFile];
   if (!data || !data.charts || data.charts.length === 0) {
     return `<div class="catalog-empty">No charts in this catalog.</div>`;
   }
+  const defaultFolder = catalogLabelToFolder(catalogLabel);
 
   return data.charts
     .map((chart) => {
@@ -347,7 +348,7 @@ function renderChartList(catalogFile) {
           ${podmanHint}
           ${zoomHtml}
           <select class="catalog-folder-select" id="catalog-folder-${escapeId(chart.number)}">
-            ${catalogFolders.map((f) => `<option value="${escapeAttr(f)}">${escapeHtml(f)}</option>`).join('')}
+            ${buildFolderOptions(defaultFolder)}
           </select>
           <button class="btn-catalog-download" ${btnDisabled}
                   onclick="downloadCatalogChart('${escapeAttr(chart.number)}', '${escapeAttr(catalogFile)}', '${escapeAttr(chart.zipfile_location)}', '${escapeAttr(chart.zipfile_datetime_iso8601)}')">
@@ -708,4 +709,39 @@ function escapeAttr(str) {
 function escapeId(str) {
   if (!str) return '';
   return str.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+/** Derive a filesystem-safe folder name from a catalog label.
+ *  Keeps letters, digits, spaces (trimmed), hyphens, underscores, and dots.
+ *  Falls back to '/' (root) when the result would be empty. */
+function catalogLabelToFolder(label) {
+  if (!label) return '/';
+  const safe = label
+    .replace(/[/\\:*?"<>|]/g, '') // strip path-unsafe chars
+    .replace(/\s+/g, ' ')         // collapse whitespace
+    .trim();
+  return safe || '/';
+}
+
+/** Format a folder value for display: root stays "/", others get a leading "/". */
+function folderDisplayName(f) {
+  return f === '/' ? '/' : '/' + f;
+}
+
+/** Build <option> elements for the folder selector.
+ *  If defaultFolder is not already in catalogFolders, prepend it
+ *  with a coloured "(new)" hint so the user knows it will be created. */
+function buildFolderOptions(defaultFolder) {
+  const isNew = defaultFolder !== '/' && !catalogFolders.includes(defaultFolder);
+  const options = [];
+  if (isNew) {
+    options.push(
+      `<option value="${escapeAttr(defaultFolder)}" selected style="color:var(--md-sys-color-primary,#1a73e8)">${escapeHtml(folderDisplayName(defaultFolder))} ✦ new</option>`
+    );
+  }
+  for (const f of catalogFolders) {
+    const selected = !isNew && f === defaultFolder ? ' selected' : '';
+    options.push(`<option value="${escapeAttr(f)}"${selected}>${escapeHtml(folderDisplayName(f))}</option>`);
+  }
+  return options.join('');
 }
