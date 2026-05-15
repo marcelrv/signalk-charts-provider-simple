@@ -9,6 +9,7 @@ export type CpuBudgetPreset = 'single-core' | 'half' | 'all';
 export interface PluginConfig {
   chartPath: string;
   cpuBudget?: CpuBudgetPreset;
+  disableUpdateNotifications?: boolean;
 }
 
 // ---- Extended ServerAPI ----
