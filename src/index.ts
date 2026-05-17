@@ -127,6 +127,13 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
             '"all" uses every core for fastest single-bundle conversion; Signal K may be sluggish during a conversion.',
           enum: ['single-core', 'half', 'all'],
           default: 'half'
+        },
+        disableUpdateNotifications: {
+          type: 'boolean',
+          title: 'Disable chart update notifications',
+          description:
+            'When enabled, suppresses Signal K warn notifications about available chart catalog updates.',
+          default: false
         }
       }
     }),
@@ -2656,7 +2663,11 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
         const updates = checkForUpdates();
         if (updates.length > 0) {
           app.debug(`Found ${updates.length} chart update(s) available from catalog`);
-          emitCatalogUpdateNotification(updates);
+          if (props.disableUpdateNotifications) {
+            app.debug('Chart update notifications are disabled; skipping notification emit');
+          } else {
+            emitCatalogUpdateNotification(updates);
+          }
         }
       } catch (error) {
         app.debug(
