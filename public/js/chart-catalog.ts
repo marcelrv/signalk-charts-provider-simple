@@ -481,7 +481,7 @@ function renderCatalogCard(catalog: CatalogRegistryEntry): string {
         </div>
       </div>
       <div class="catalog-card-body" id="catalog-body-${catalogEscapeId(catalog.file)}">
-        ${isExpanded && catalogChartData[catalog.file] ? renderChartList(catalog.file) : ''}
+        ${isExpanded && catalogChartData[catalog.file] ? renderChartList(catalog.file, catalog.label) : ''}
       </div>
     </div>
   `;
@@ -533,11 +533,12 @@ async function toggleCatalog(catalogFile: string): Promise<void> {
   renderCatalogList();
 }
 
-function renderChartList(catalogFile: string): string {
+function renderChartList(catalogFile: string, catalogLabel: string): string {
   const data = catalogChartData[catalogFile];
   if (!data?.charts || data.charts.length === 0) {
     return `<div class="catalog-empty">No charts in this catalog.</div>`;
   }
+  const defaultFolder = catalogLabelToFolder(catalogLabel);
 
   return data.charts
     .map((chart) => {
@@ -625,7 +626,7 @@ function renderChartList(catalogFile: string): string {
           ${podmanHint}
           ${zoomHtml}
           <select class="catalog-folder-select" id="catalog-folder-${catalogEscapeId(chart.number)}">
-            ${catalogFolders.map((f) => `<option value="${catalogEscapeAttr(f)}">${catalogEscapeHtml(f)}</option>`).join('')}
+            ${buildFolderOptions(defaultFolder)}
           </select>
           <button class="btn-catalog-download" ${btnDisabled}
                   data-catalog-download="${catalogEscapeAttr(chart.number)}"
@@ -1090,6 +1091,46 @@ function categoryLabel(category: CatalogCategory | string): string {
     general: 'General'
   };
   return labels[category] ?? category;
+}
+
+/**
+ * Derive a filesystem-safe folder name from a catalog label.
+ * Keeps letters, digits, spaces (trimmed), hyphens, underscores, and dots.
+ * Falls back to '/' when the result would be empty.
+ */
+function catalogLabelToFolder(label: string | undefined | null): string {
+  if (!label) {
+    return '/';
+  }
+  const safe = label
+    .replace(/[/\\:*?"<>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return safe || '/';
+}
+
+function folderDisplayName(folder: string): string {
+  return folder === '/' ? '/' : `/${folder}`;
+}
+
+function buildFolderOptions(defaultFolder: string): string {
+  const isNew = defaultFolder !== '/' && !catalogFolders.includes(defaultFolder);
+  const options: string[] = [];
+
+  if (isNew) {
+    options.push(
+      `<option value="${catalogEscapeAttr(defaultFolder)}" selected style="color:var(--md-sys-color-primary,#1a73e8)">${catalogEscapeHtml(folderDisplayName(defaultFolder))} (new)</option>`
+    );
+  }
+
+  for (const folder of catalogFolders) {
+    const selected = !isNew && folder === defaultFolder ? ' selected' : '';
+    options.push(
+      `<option value="${catalogEscapeAttr(folder)}"${selected}>${catalogEscapeHtml(folderDisplayName(folder))}</option>`
+    );
+  }
+
+  return options.join('');
 }
 
 function catalogEscapeHtml(str: string | undefined | null): string {
