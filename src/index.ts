@@ -133,11 +133,15 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
           enum: ['single-core', 'half', 'all'],
           default: 'half'
         },
+        _notificationsHeader: {
+          type: 'null',
+          title: 'Notifications',
+          description:
+            'When enabled, suppresses Signal K warn notifications about available chart catalog updates.'
+        },
         disableUpdateNotifications: {
           type: 'boolean',
           title: 'Disable chart update notifications',
-          description:
-            'When enabled, suppresses Signal K warn notifications about available chart catalog updates.',
           default: false
         }
       }
