@@ -79,6 +79,16 @@ function initDownloadInterface(): void {
         </div>
 
         <div class="form-group">
+          <label for="downloadChartName">Chart Name</label>
+          <input
+            type="text"
+            id="downloadChartName"
+            placeholder="e.g. NOAA Chesapeake Bay"
+            class="input-field"
+          />
+        </div>
+
+        <div class="form-group">
           <label for="downloadFolder">Target Folder</label>
           <select id="downloadFolder" class="input-field">
             <option value="/">/</option>
@@ -172,18 +182,25 @@ async function loadFoldersForDownload(): Promise<void> {
 
 async function startDownload(): Promise<void> {
   const urlInput = document.getElementById('downloadUrl') as HTMLInputElement | null;
+  const chartNameInput = document.getElementById('downloadChartName') as HTMLInputElement | null;
   const folderInput = document.getElementById('downloadFolder') as HTMLSelectElement | null;
   const statusDiv = document.getElementById('downloadStatus');
 
-  if (!urlInput || !folderInput || !statusDiv) {
+  if (!urlInput || !chartNameInput || !folderInput || !statusDiv) {
     return;
   }
 
   const url = urlInput.value.trim();
+  const chartName = chartNameInput.value.trim();
   const folder = folderInput.value;
 
   if (!url) {
     statusDiv.innerHTML = '<div class="error-message">Please enter a URL</div>';
+    return;
+  }
+
+  if (!chartName) {
+    statusDiv.innerHTML = '<div class="error-message">Please enter a chart name</div>';
     return;
   }
 
@@ -201,6 +218,7 @@ async function startDownload(): Promise<void> {
     const formData = new FormData();
     formData.append('url', url);
     formData.append('targetFolder', folder);
+    formData.append('chartName', chartName);
 
     const response = await fetch(`${DOWNLOAD_API_BASE}/download-chart-locker`, {
       method: 'POST',
@@ -215,6 +233,7 @@ async function startDownload(): Promise<void> {
     if (result.success) {
       statusDiv.innerHTML = `<div class="success-message">Download started! Job ID: ${downloadEscapeHtml(result.jobId ?? '')}</div>`;
       urlInput.value = '';
+      chartNameInput.value = '';
       setTimeout(() => {
         void loadActiveDownloads();
       }, 500);
