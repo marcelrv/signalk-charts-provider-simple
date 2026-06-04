@@ -361,38 +361,53 @@ describe('findRepairableCharts + repair round-trip', () => {
     }
   });
 
-  it('is deterministic when metadata has duplicate name rows', async () => {
-    const sub = fs.mkdtempSync(path.join(dir, 'dupes-'));
-    // The table has no UNIQUE constraint: an EMPTY format row plus a
-    // non-empty one. A naive last-write-wins snapshot could read the empty
-    // row last and wrongly insert a second format. "Any non-empty = present"
-    // must skip it.
-    const file = buildMbtiles(sub, 'dupes.mbtiles', {
-      metadata: { name: 'Dupes' },
-      metadataRows: [
-        { name: 'format', value: '' },
-        { name: 'format', value: 'jpg' }
-      ],
-      tiles: BROKEN_TILES
+  // The table has no UNIQUE constraint, so a key can have both an empty and
+  // a non-empty row. "Any non-empty = present" must skip the key regardless
+  // of row order — the inverse (non-empty→empty) order is the one a naive
+  // last-row-wins read would get wrong, so both orders are exercised.
+  for (const order of ['empty-first', 'non-empty-first'] as const) {
+    it(`is deterministic when metadata has duplicate name rows (${order})`, async () => {
+      const sub = fs.mkdtempSync(path.join(dir, `dupes-${order}-`));
+      const rows =
+        order === 'empty-first'
+          ? [
+              { name: 'format', value: '' },
+              { name: 'format', value: 'jpg' }
+            ]
+          : [
+              { name: 'format', value: 'jpg' },
+              { name: 'format', value: '' }
+            ];
+      const file = buildMbtiles(sub, 'dupes.mbtiles', {
+        metadata: { name: 'Dupes' },
+        metadataRows: rows,
+        tiles: BROKEN_TILES
+      });
+
+      const repairable = await findRepairableCharts(sub);
+      const derived = repairable[0]?.derived;
+      assert.ok(derived);
+
+      const result = await repairMbtilesMetadata(file, derived);
+      assert.strictEqual(result.ok, true);
+      assert.ok(result.written.includes('bounds'), 'bounds written');
+      assert.ok(
+        result.skipped.includes('format'),
+        'present (non-empty) format kept, not duplicated'
+      );
+
+      // No third format row was inserted — the two seeded rows are unchanged.
+      const db = new DatabaseSync(file, { readOnly: true });
+      try {
+        const countRow = db
+          .prepare("SELECT COUNT(*) AS n FROM metadata WHERE name = 'format'")
+          .get() as { n: number };
+        assert.strictEqual(countRow.n, 2, 'no duplicate format row inserted');
+      } finally {
+        db.close();
+      }
     });
-
-    const repairable = await findRepairableCharts(sub);
-    const derived = repairable[0]?.derived;
-    assert.ok(derived);
-
-    const result = await repairMbtilesMetadata(file, derived);
-    assert.strictEqual(result.ok, true);
-    assert.ok(result.written.includes('bounds'), 'bounds written');
-    assert.ok(result.skipped.includes('format'), 'present (non-empty) format kept, not duplicated');
-
-    // No new format row was added — the non-empty value is still 'jpg'.
-    const reader = await open(file);
-    try {
-      assert.strictEqual(reader.getInfo().format, 'jpg');
-    } finally {
-      reader.close();
-    }
-  });
+  }
 
   it('surfaces and repairs an uppercase .MBTILES file', async () => {
     const sub = fs.mkdtempSync(path.join(dir, 'upper-'));
