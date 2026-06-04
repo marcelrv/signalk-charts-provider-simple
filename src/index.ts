@@ -3,7 +3,7 @@ import fs from 'fs';
 import https from 'https';
 import type { Plugin, Path } from '@signalk/server-api';
 import { SKVersion } from '@signalk/server-api';
-import { findCharts } from './charts-loader.js';
+import { findCharts, findRepairableCharts } from './charts-loader.js';
 import { scanChartsRecursively, scanAllFolders } from './utils/file-scanner.js';
 import { initChartState, isChartEnabled, setChartEnabled } from './utils/chart-state.js';
 import { downloadManager } from './utils/download-manager.js';
@@ -42,7 +42,8 @@ import {
   sweepStaleQuarantineDirs
 } from './utils/quarantine.js';
 import { cleanCatalogTitle } from './utils/catalog-title.js';
-import { setMbtilesDisplayName } from './utils/mbtiles-metadata.js';
+import { setMbtilesDisplayName, repairMbtilesMetadata } from './utils/mbtiles-metadata.js';
+import { open as openMbtilesReader } from './utils/mbtiles-reader.js';
 import {
   initRncConverter,
   processRncZip,
@@ -492,6 +493,14 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
           .map((c) => c._filePath)
           .filter(Boolean)
       );
+      // Repairable charts (valid tiles, missing metadata.bounds) are
+      // deliberately excluded from findCharts(), so they'd otherwise be
+      // unlinked here as "invalid" — destroying the very files the repair
+      // flow exists to fix. Treat them as valid so the sweep skips them.
+      const repairable = await findRepairableCharts(chartPath);
+      for (const rc of repairable) {
+        validPaths.add(rc.filePath);
+      }
       for (const file of allFiles) {
         if (file.name.endsWith('.mbtiles') && !validPaths.has(file.path)) {
           console.log(`[charts-provider] Removing invalid .mbtiles file: ${file.name}`);
@@ -606,6 +615,13 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
 
   const ChartMetadataBody = Type.Object({
     name: Type.String({ minLength: 1 })
+  });
+
+  const RepairChartBody = Type.Object({
+    // Case-insensitive: discovery matches `.mbtiles` case-insensitively, so
+    // a hand-copied FOO.MBTILES can appear in the repair list and must pass
+    // here too.
+    chartPath: Type.String({ minLength: 1, pattern: '\\.[mM][bB][tT][iI][lL][eE][sS]$' })
   });
 
   // Multipart/header field schemas. Same domain rules as the JSON-body
@@ -1262,6 +1278,123 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
           .status(500)
           .send(
             'Error renaming chart: ' + (error instanceof Error ? error.message : String(error))
+          );
+      }
+    });
+
+    // List MBTiles that the loader dropped for missing `metadata.bounds`
+    // but that have a valid tile pyramid — the Manage UI surfaces these
+    // with a Repair action. Mirrors /local-charts' base-path resolution and
+    // error shape.
+    router.get('/repairable-charts', async (_req: Request, res: Response) => {
+      try {
+        const basePath = props.chartPath || defaultChartsPath;
+        const repairable = await findRepairableCharts(basePath);
+        res.json({ repairable, basePath });
+      } catch (error) {
+        console.error('Error listing repairable charts:', error);
+        res.status(500).send('Error listing repairable charts');
+      }
+    });
+
+    // Derive the missing metadata from the tile pyramid and write it into
+    // the file so the chart loads. Mirrors /rename-chart: path-safety guard,
+    // existence check, metadata write, refresh + delta. The read-only reader
+    // used to derive values is closed before the writer opens.
+    router.post('/repair-chart', async (req: Request, res: Response) => {
+      const body = parseBody(RepairChartBody, req, res);
+      if (!body) {
+        return;
+      }
+      const { chartPath: chartPathBody } = body;
+      app.debug(`Repair chart request: chartPath=${chartPathBody}`);
+
+      try {
+        const basePath = props.chartPath || defaultChartsPath;
+        const sourcePath = path.join(basePath, chartPathBody);
+
+        if (!isWithinBase(sourcePath, basePath)) {
+          res.status(403).send('Access denied: Invalid path');
+          return;
+        }
+
+        if (!fs.existsSync(sourcePath)) {
+          app.error(`Chart not found at: ${sourcePath}`);
+          res.status(404).send('Chart not found');
+          return;
+        }
+
+        // Re-derive from a fresh read-only reader, then close it before the
+        // writer opens — two handles on one sqlite file race on the lock.
+        const reader = await openMbtilesReader(sourcePath);
+        let derived;
+        try {
+          if (!reader.hasTiles()) {
+            res.status(422).json({ error: 'Chart has no tiles — cannot derive metadata' });
+            return;
+          }
+          const bounds = reader.deriveBoundsFromTiles();
+          const zoom = reader.getZoomRangeFromTiles();
+          if (!bounds || !zoom) {
+            res.status(422).json({ error: 'Could not derive bounds from tiles' });
+            return;
+          }
+          const format = reader.sniffFormatFromTiles() ?? reader.getInfo().format ?? 'png';
+          const tileSize = format === 'pbf' ? undefined : reader.getTilePixelSize();
+          derived = {
+            bounds,
+            minzoom: zoom.minzoom,
+            maxzoom: zoom.maxzoom,
+            format,
+            ...(tileSize !== undefined && tileSize !== 256 ? { tileSize } : {})
+          };
+        } finally {
+          reader.close();
+        }
+
+        const result = await repairMbtilesMetadata(sourcePath, derived, {
+          onMessage: (m) => app.debug(`repair-chart: ${m}`)
+        });
+        if (!result.ok) {
+          console.warn(
+            `[charts-provider] WARNING: ${result.message} (${path.basename(sourcePath)})`
+          );
+          res.status(500).json({ error: result.message });
+          return;
+        }
+
+        if (derived.tileSize !== undefined && derived.tileSize !== 256) {
+          console.warn(
+            `[charts-provider] ${path.basename(sourcePath)} uses ${derived.tileSize}px tiles; ` +
+              `Freeboard-SK renders charts at 256px and needs its own tileSize support to ` +
+              `display this correctly.`
+          );
+        }
+
+        await refreshChartProviders();
+
+        // Case-insensitive strip so a repaired FOO.MBTILES still matches the
+        // chartProviders key the loader derives (also case-insensitive).
+        const chartId = path.basename(chartPathBody).replace(/\.mbtiles$/i, '');
+        if (chartProviders[chartId]) {
+          const chartData = sanitizeProvider(chartProviders[chartId], 2);
+          emitChartDelta(chartId, chartData);
+        }
+
+        res.status(200).json({
+          success: true,
+          chartId,
+          written: result.written,
+          skipped: result.skipped
+        });
+      } catch (error) {
+        app.error(
+          'Error repairing chart: ' + (error instanceof Error ? error.message : String(error))
+        );
+        res
+          .status(500)
+          .send(
+            'Error repairing chart: ' + (error instanceof Error ? error.message : String(error))
           );
       }
     });

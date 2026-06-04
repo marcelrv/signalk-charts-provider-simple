@@ -2,7 +2,14 @@ import path from 'path';
 import { promises as fs } from 'fs';
 import { parseStringPromise } from 'xml2js';
 import { open as openMbtiles } from './utils/mbtiles-reader.js';
-import type { ChartProvider, TilemapXml, VectorLayer } from './types.js';
+import type { MBTilesReader } from './utils/mbtiles-reader.js';
+import type {
+  ChartProvider,
+  RepairableChart,
+  RepairableDerived,
+  TilemapXml,
+  VectorLayer
+} from './types.js';
 
 const KNOWN_CHART_TYPES = new Set(['tilelayer', 's-57', 'mapstylejson', 'tilejson', 'wms', 'wmts']);
 
@@ -76,6 +83,12 @@ async function openMbtilesFile(file: string, filename: string): Promise<ChartPro
 
     const vectorLayers = metadata.vector_layers ? parseVectorLayers(metadata.vector_layers) : [];
 
+    // Advertise a non-256 tile size so clients build the raster source on
+    // the right grid. We only read PNG dimensions (getTilePixelSize) and
+    // only carry the field when it isn't the conventional 256, keeping the
+    // common case's descriptor unchanged.
+    const tileSize = readTileSize(metadata.format, reader);
+
     const data: ChartProvider = {
       _fileFormat: 'mbtiles',
       _filePath: file,
@@ -91,6 +104,7 @@ async function openMbtilesFile(file: string, filename: string): Promise<ChartPro
       format: metadata.format ?? 'png',
       type: resolveChartType(metadata.type),
       scale: parseInt(metadata.scale ?? '', 10) || 250000,
+      ...(tileSize !== undefined ? { tileSize } : {}),
 
       v1: {
         tilemapUrl: `~tilePath~/${identifier}/{z}/{x}/{y}`,
@@ -99,7 +113,8 @@ async function openMbtilesFile(file: string, filename: string): Promise<ChartPro
 
       v2: {
         url: `~tilePath~/${identifier}/{z}/{x}/{y}`,
-        layers: vectorLayers
+        layers: vectorLayers,
+        ...(tileSize !== undefined ? { tileSize } : {})
       }
     };
     return data;
@@ -229,4 +244,133 @@ async function parseMetadataJson(metadataJsonPath: string): Promise<Partial<Char
 function parseIntIfNotUndefined(val: unknown): number | undefined {
   const parsed = parseInt(String(val));
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * Detect a non-default raster tile size for the chart descriptor. Returns a
+ * value only for raster formats (png/jpg/webp or unset, which defaults to
+ * png) when the detected size isn't the conventional 256; vector (pbf) and
+ * 256px charts get undefined so the descriptor stays minimal.
+ */
+function readTileSize(format: string | undefined, reader: MBTilesReader): number | undefined {
+  if (format === 'pbf') {
+    return undefined;
+  }
+  const size = reader.getTilePixelSize();
+  if (size === undefined || size === 256) {
+    return undefined;
+  }
+  return size;
+}
+
+/**
+ * Find MBTiles that `findCharts` drops because `metadata.bounds` is missing
+ * but that have a valid tile pyramid — i.e. they can be repaired by
+ * deriving the missing metadata from the tiles table. Directories and
+ * already-loadable charts are not returned. The returned `relativePath` is
+ * the wire id the repair route expects (mirrors the rename flow's
+ * `chartPath`).
+ */
+export async function findRepairableCharts(chartBaseDir: string): Promise<RepairableChart[]> {
+  try {
+    const results = await findRepairableRecursive(chartBaseDir, chartBaseDir);
+    return results.filter((c): c is RepairableChart => c !== null);
+  } catch (err) {
+    console.error(
+      `Error scanning for repairable charts in ${chartBaseDir}: ${err instanceof Error ? err.message : String(err)}`
+    );
+    return [];
+  }
+}
+
+async function findRepairableRecursive(
+  currentDir: string,
+  baseDir: string
+): Promise<(RepairableChart | null)[]> {
+  const files = await fs.readdir(currentDir, { withFileTypes: true });
+  const results: (RepairableChart | null)[][] = [];
+
+  for (const file of files) {
+    const filePath = path.resolve(currentDir, file.name);
+
+    if (file.name.match(/\.mbtiles$/i)) {
+      results.push([await inspectMbtilesForRepair(filePath, file.name, baseDir)]);
+    } else if (file.isDirectory()) {
+      if (file.name.startsWith('.') || file.name === 'node_modules') {
+        results.push([]);
+        continue;
+      }
+      results.push(await findRepairableRecursive(filePath, baseDir));
+    } else {
+      results.push([]);
+    }
+  }
+
+  return results.flat();
+}
+
+/**
+ * Mirror of `openMbtilesFile` with the load gate inverted: a chart is
+ * repairable when its metadata table is non-empty, `bounds` is missing, and
+ * it has tiles to derive bounds from. Anything that already loads (has
+ * bounds) or can't be fixed (no tiles) returns null. The read-only reader is
+ * always closed before returning.
+ */
+async function inspectMbtilesForRepair(
+  file: string,
+  filename: string,
+  baseDir: string
+): Promise<RepairableChart | null> {
+  let reader: MBTilesReader | null = null;
+  try {
+    reader = await openMbtiles(file);
+    const metadata = reader.getInfo();
+
+    // Already loadable, or no metadata at all — not our case.
+    if (
+      !metadata ||
+      Object.keys(metadata).length === 0 ||
+      metadata.bounds !== undefined ||
+      !reader.hasTiles()
+    ) {
+      return null;
+    }
+
+    const bounds = reader.deriveBoundsFromTiles();
+    const zoom = reader.getZoomRangeFromTiles();
+    if (!bounds || !zoom) {
+      // Tiles present but unreadable extent — can't synthesize bounds.
+      return null;
+    }
+
+    const format = reader.sniffFormatFromTiles() ?? metadata.format ?? 'png';
+    const tileSize = readTileSize(format, reader);
+
+    const identifier = filename.replace(/\.mbtiles$/i, '');
+    const derived: RepairableDerived = {
+      bounds,
+      minzoom: zoom.minzoom,
+      maxzoom: zoom.maxzoom,
+      format,
+      ...(tileSize !== undefined ? { tileSize } : {})
+    };
+
+    return {
+      identifier,
+      filePath: file,
+      relativePath: path.relative(baseDir, file),
+      name: metadata.name ?? metadata.id ?? identifier,
+      reason: 'missing_bounds',
+      hasTiles: true,
+      derived
+    };
+  } catch (e) {
+    console.error(
+      `Error inspecting chart for repair ${file}`,
+      e instanceof Error ? e.message : String(e)
+    );
+    return null;
+  } finally {
+    reader?.close();
+  }
 }

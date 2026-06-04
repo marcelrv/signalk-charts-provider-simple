@@ -33,6 +33,15 @@ export interface ChartV1Data {
 export interface ChartV2Data {
   url: string;
   layers: string[];
+  /**
+   * Tile edge length in pixels (256 or 512). Omitted means the
+   * conventional 256. Clients that build raster sources (Freeboard-SK's
+   * OpenLayers XYZ, MapLibre raster) need this to address 512px tiles on
+   * the correct grid; without it a 512px chart renders mis-scaled.
+   * Carried on the v2 descriptor only — that's the normalized shape
+   * Signal K v2 consumers read.
+   */
+  tileSize?: number;
 }
 
 export type ChartFileFormat = 'mbtiles' | 'directory';
@@ -53,6 +62,8 @@ export interface ChartProvider {
   format: string;
   type: ChartType;
   scale: number;
+  /** Detected tile pixel size (256/512) when known; see ChartV2Data.tileSize. */
+  tileSize?: number;
 
   v1: ChartV1Data;
   v2: ChartV2Data;
@@ -72,6 +83,40 @@ export interface SanitizedChart {
   chartLayers?: string[];
   url?: string;
   layers?: string[];
+  tileSize?: number;
+}
+
+// ---- Repairable charts ----
+// Valid MBTiles that `findCharts` drops because `metadata.bounds` is
+// missing (charts-loader's load gate). They have tiles but no usable
+// metadata, so they never enter `chartProviders` and have no card in the
+// Manage UI. `findRepairableCharts` surfaces them separately so the UI can
+// offer a Repair action that derives the missing metadata from the tile
+// pyramid and writes it back into the file.
+
+export type RepairReason = 'missing_bounds';
+
+export interface RepairableDerived {
+  bounds: number[];
+  minzoom: number;
+  maxzoom: number;
+  format: string;
+  tileSize?: number;
+}
+
+export interface RepairableChart {
+  /** Filename without `.mbtiles` — the `chartProviders` key once repaired. */
+  identifier: string;
+  /** Absolute path on disk. */
+  filePath: string;
+  /** Path relative to the chart base — the wire id the repair route POSTs. */
+  relativePath: string;
+  /** `metadata.name` if present, else the identifier. */
+  name: string;
+  reason: RepairReason;
+  hasTiles: boolean;
+  /** What repair would write, also shown as a preview in the UI. */
+  derived: RepairableDerived | null;
 }
 
 // ---- MBTiles Metadata ----

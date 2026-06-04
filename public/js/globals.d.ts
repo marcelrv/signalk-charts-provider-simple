@@ -64,6 +64,9 @@ declare global {
     showRenameDialog(chartPath: string, currentName: string, folder: string): void;
     closeRenameModal(event?: Event): void;
     confirmRename(): Promise<void>;
+    showRepairDialog(chartPath: string, name: string): void;
+    closeRepairModal(event?: Event): void;
+    confirmRepair(): Promise<void>;
     closeDuplicateModal(event?: Event): void;
     confirmDuplicate(): void;
     toggleChart(relativePath: string): Promise<void>;
