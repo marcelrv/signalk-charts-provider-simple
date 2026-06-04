@@ -293,20 +293,27 @@ export async function repairMbtilesMetadata(
         inTransaction = true;
 
         // Snapshot existing names so we only fill what's absent or empty.
-        const existing = new Map<string, string>();
+        // The metadata table has no UNIQUE constraint on `name` (see the
+        // patchS57Mbtiles note above), so a key can legitimately have
+        // several rows — including a mix of empty and non-empty values.
+        // Treat a name as "present" when ANY row for it is non-empty, so a
+        // stray empty duplicate doesn't trick us into inserting a second
+        // value row.
+        const existingNonEmpty = new Set<string>();
         for (const r of db.prepare('SELECT name, value FROM metadata').all() as {
           name: string;
           value: string | null;
         }[]) {
-          existing.set(r.name, r.value ?? '');
+          if (r.value !== null && r.value !== '') {
+            existingNonEmpty.add(r.name);
+          }
         }
 
         const written: string[] = [];
         const skipped: string[] = [];
         const insert = db.prepare('INSERT INTO metadata (name, value) VALUES (?, ?)');
         for (const c of candidates) {
-          const present = existing.get(c.name);
-          if (present !== undefined && present !== '') {
+          if (existingNonEmpty.has(c.name)) {
             skipped.push(c.name);
             continue;
           }
@@ -314,13 +321,18 @@ export async function repairMbtilesMetadata(
           written.push(c.name);
         }
 
-        // Verify-after-write: every name we wrote must read back equal.
+        // Verify-after-write: read the LAST row written for each name
+        // (ORDER BY rowid DESC) so the check is deterministic even when
+        // older duplicate rows exist for the same key.
         let verifyError = '';
+        const verify = db.prepare(
+          'SELECT value FROM metadata WHERE name = ? ORDER BY rowid DESC LIMIT 1'
+        );
         for (const c of candidates) {
           if (!written.includes(c.name)) {
             continue;
           }
-          const row = db.prepare('SELECT value FROM metadata WHERE name = ?').get(c.name);
+          const row = verify.get(c.name);
           const got =
             typeof row === 'object' && row !== null && 'value' in row ? String(row.value) : null;
           if (got !== c.value) {

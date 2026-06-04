@@ -43,6 +43,8 @@ interface TileSpec {
 
 interface BuildOpts {
   metadata?: Record<string, string>;
+  /** Raw metadata rows, allowing duplicate names (the table has no UNIQUE constraint). */
+  metadataRows?: { name: string; value: string }[];
   tiles?: TileSpec[];
   /** When true, omit the tiles table entirely. */
   noTilesTable?: boolean;
@@ -64,6 +66,9 @@ function buildMbtiles(dir: string, filename: string, opts: BuildOpts): string {
   const insMeta = db.prepare('INSERT INTO metadata (name, value) VALUES (?, ?)');
   for (const [name, value] of Object.entries(opts.metadata ?? {})) {
     insMeta.run(name, value);
+  }
+  for (const row of opts.metadataRows ?? []) {
+    insMeta.run(row.name, row.value);
   }
   if (!opts.noTilesTable) {
     const insTile = db.prepare(
@@ -126,7 +131,14 @@ describe('MBTilesReader repair helpers', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mbtiles-repair-'));
   });
   after(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    // On Windows the node:sqlite file handle can linger briefly after
+    // close(), so an immediate recursive rm hits EPERM. Retry, and never
+    // let a teardown failure fail the suite — a leaked temp dir is harmless.
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    } catch {
+      /* best-effort temp cleanup */
+    }
   });
 
   it('hasTiles / getZoomRangeFromTiles / deriveBoundsFromTiles', async () => {
@@ -235,7 +247,14 @@ describe('findRepairableCharts + repair round-trip', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mbtiles-repair-loader-'));
   });
   after(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    // On Windows the node:sqlite file handle can linger briefly after
+    // close(), so an immediate recursive rm hits EPERM. Retry, and never
+    // let a teardown failure fail the suite — a leaked temp dir is harmless.
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    } catch {
+      /* best-effort temp cleanup */
+    }
   });
 
   const BROKEN_TILES: TileSpec[] = [
@@ -340,5 +359,54 @@ describe('findRepairableCharts + repair round-trip', () => {
     } finally {
       reader.close();
     }
+  });
+
+  it('is deterministic when metadata has duplicate name rows', async () => {
+    const sub = fs.mkdtempSync(path.join(dir, 'dupes-'));
+    // The table has no UNIQUE constraint: an EMPTY format row plus a
+    // non-empty one. A naive last-write-wins snapshot could read the empty
+    // row last and wrongly insert a second format. "Any non-empty = present"
+    // must skip it.
+    const file = buildMbtiles(sub, 'dupes.mbtiles', {
+      metadata: { name: 'Dupes' },
+      metadataRows: [
+        { name: 'format', value: '' },
+        { name: 'format', value: 'jpg' }
+      ],
+      tiles: BROKEN_TILES
+    });
+
+    const repairable = await findRepairableCharts(sub);
+    const derived = repairable[0]?.derived;
+    assert.ok(derived);
+
+    const result = await repairMbtilesMetadata(file, derived);
+    assert.strictEqual(result.ok, true);
+    assert.ok(result.written.includes('bounds'), 'bounds written');
+    assert.ok(result.skipped.includes('format'), 'present (non-empty) format kept, not duplicated');
+
+    // No new format row was added — the non-empty value is still 'jpg'.
+    const reader = await open(file);
+    try {
+      assert.strictEqual(reader.getInfo().format, 'jpg');
+    } finally {
+      reader.close();
+    }
+  });
+
+  it('surfaces and repairs an uppercase .MBTILES file', async () => {
+    const sub = fs.mkdtempSync(path.join(dir, 'upper-'));
+    const file = buildMbtiles(sub, 'WORLD.MBTILES', {
+      metadata: { name: 'Upper' },
+      tiles: BROKEN_TILES
+    });
+
+    const repairable = await findRepairableCharts(sub);
+    assert.strictEqual(repairable.length, 1, 'uppercase ext is discovered');
+    assert.strictEqual(repairable[0].relativePath, 'WORLD.MBTILES');
+
+    const result = await repairMbtilesMetadata(file, repairable[0].derived!);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(Object.keys(await findCharts(sub)).length, 1, 'repaired uppercase loads');
   });
 });

@@ -493,6 +493,14 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
           .map((c) => c._filePath)
           .filter(Boolean)
       );
+      // Repairable charts (valid tiles, missing metadata.bounds) are
+      // deliberately excluded from findCharts(), so they'd otherwise be
+      // unlinked here as "invalid" — destroying the very files the repair
+      // flow exists to fix. Treat them as valid so the sweep skips them.
+      const repairable = await findRepairableCharts(chartPath);
+      for (const rc of repairable) {
+        validPaths.add(rc.filePath);
+      }
       for (const file of allFiles) {
         if (file.name.endsWith('.mbtiles') && !validPaths.has(file.path)) {
           console.log(`[charts-provider] Removing invalid .mbtiles file: ${file.name}`);
@@ -610,7 +618,10 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
   });
 
   const RepairChartBody = Type.Object({
-    chartPath: Type.String({ minLength: 1, pattern: '\\.mbtiles$' })
+    // Case-insensitive: discovery matches `.mbtiles` case-insensitively, so
+    // a hand-copied FOO.MBTILES can appear in the repair list and must pass
+    // here too.
+    chartPath: Type.String({ minLength: 1, pattern: '\\.[mM][bB][tT][iI][lL][eE][sS]$' })
   });
 
   // Multipart/header field schemas. Same domain rules as the JSON-body
@@ -1362,7 +1373,9 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
 
         await refreshChartProviders();
 
-        const chartId = path.basename(chartPathBody).replace(/\.mbtiles$/, '');
+        // Case-insensitive strip so a repaired FOO.MBTILES still matches the
+        // chartProviders key the loader derives (also case-insensitive).
+        const chartId = path.basename(chartPathBody).replace(/\.mbtiles$/i, '');
         if (chartProviders[chartId]) {
           const chartData = sanitizeProvider(chartProviders[chartId], 2);
           emitChartDelta(chartId, chartData);
