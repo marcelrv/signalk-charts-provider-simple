@@ -26,7 +26,7 @@ export interface PatchResult {
   message: string;
 }
 
-interface PatchOptions {
+export interface PatchOptions {
   /** Sleep callback for the retry — defaults to a real setTimeout. Tests inject. */
   sleep?: (ms: number) => Promise<void>;
   /** Retry delay in ms (default 500). */
@@ -194,6 +194,181 @@ export async function patchS57Mbtiles(
     name: null,
     attempts: 2,
     message: lastError || 'MBTiles metadata patch failed (unknown reason)'
+  };
+}
+
+export interface RepairDerived {
+  /** `[minLon, minLat, maxLon, maxLat]`, written as a comma string. */
+  bounds: number[];
+  minzoom: number;
+  maxzoom: number;
+  format: string;
+  /** 256/512 when known; omitted leaves no `tileSize` row. */
+  tileSize?: number;
+}
+
+export interface RepairResult {
+  ok: boolean;
+  /** Metadata names actually inserted (were absent). */
+  written: string[];
+  /** Metadata names left untouched because a non-empty row already existed. */
+  skipped: string[];
+  attempts: number;
+  message: string;
+}
+
+/**
+ * Backfill the metadata an MBTiles needs to load when a valid tile pyramid
+ * was imported without it. The loader drops any chart whose
+ * `metadata.bounds` is missing; this writes `bounds` (plus
+ * `minzoom`/`maxzoom`/`format`/`tileSize`) derived from the tiles table so
+ * the chart loads and serves.
+ *
+ * Only-fill-absent: a metadata name is written only when no non-empty row
+ * for it already exists. A chart that has, say, a correct `minzoom` but a
+ * missing `bounds` keeps its `minzoom`. We never DELETE — unlike the S-57
+ * patcher, repair must not clobber values the file already carries.
+ *
+ * Same atomicity and resilience as patchS57Mbtiles: a single transaction,
+ * verify-after-write inside it, ROLLBACK on mismatch, and one retry after
+ * `retryDelayMs` to ride out a transient sqlite lock. Best-effort: never
+ * throws. The caller must close any read-only reader on this file before
+ * calling — node:sqlite opens its own writable handle here.
+ */
+export async function repairMbtilesMetadata(
+  outputPath: string,
+  derived: RepairDerived,
+  options: PatchOptions = {}
+): Promise<RepairResult> {
+  const sleeper = options.sleep ?? sleep;
+  const retryMs = options.retryDelayMs ?? DEFAULT_RETRY_MS;
+  const log = (m: string): void => {
+    try {
+      options.onMessage?.(m);
+    } catch {
+      /* best-effort logging */
+    }
+  };
+
+  if (!fs.existsSync(outputPath)) {
+    const message = `MBTiles file does not exist: ${outputPath}`;
+    log(message);
+    return { ok: false, written: [], skipped: [], attempts: 0, message };
+  }
+
+  const sqlite = loadSqlite();
+  if (!sqlite.ok) {
+    log(sqlite.reason);
+    return { ok: false, written: [], skipped: [], attempts: 0, message: sqlite.reason };
+  }
+
+  // The full candidate set, in a stable order. tileSize is only a candidate
+  // when supplied (it's optional metadata).
+  const candidates: { name: string; value: string }[] = [
+    { name: 'bounds', value: derived.bounds.join(',') },
+    { name: 'minzoom', value: String(derived.minzoom) },
+    { name: 'maxzoom', value: String(derived.maxzoom) },
+    { name: 'format', value: derived.format }
+  ];
+  if (derived.tileSize !== undefined) {
+    candidates.push({ name: 'tilesize', value: String(derived.tileSize) });
+  }
+
+  let lastError = '';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (attempt === 2) {
+      log(`Retrying MBTiles metadata repair after ${retryMs}ms…`);
+      try {
+        await sleeper(retryMs);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(`Sleep before retry threw (continuing): ${msg}`);
+      }
+    }
+    try {
+      const db = new sqlite.DatabaseSync(outputPath);
+      let inTransaction = false;
+      try {
+        db.exec('BEGIN TRANSACTION');
+        inTransaction = true;
+
+        // Snapshot existing names so we only fill what's absent or empty.
+        const existing = new Map<string, string>();
+        for (const r of db.prepare('SELECT name, value FROM metadata').all() as {
+          name: string;
+          value: string | null;
+        }[]) {
+          existing.set(r.name, r.value ?? '');
+        }
+
+        const written: string[] = [];
+        const skipped: string[] = [];
+        const insert = db.prepare('INSERT INTO metadata (name, value) VALUES (?, ?)');
+        for (const c of candidates) {
+          const present = existing.get(c.name);
+          if (present !== undefined && present !== '') {
+            skipped.push(c.name);
+            continue;
+          }
+          insert.run(c.name, c.value);
+          written.push(c.name);
+        }
+
+        // Verify-after-write: every name we wrote must read back equal.
+        let verifyError = '';
+        for (const c of candidates) {
+          if (!written.includes(c.name)) {
+            continue;
+          }
+          const row = db.prepare('SELECT value FROM metadata WHERE name = ?').get(c.name);
+          const got =
+            typeof row === 'object' && row !== null && 'value' in row ? String(row.value) : null;
+          if (got !== c.value) {
+            verifyError = `repair verify failed for '${c.name}': got '${got}', wanted '${c.value}'`;
+            break;
+          }
+        }
+
+        if (verifyError) {
+          db.exec('ROLLBACK');
+          inTransaction = false;
+          lastError = verifyError;
+          log(lastError);
+          continue;
+        }
+
+        db.exec('COMMIT');
+        inTransaction = false;
+        const message =
+          `Repaired MBTiles metadata: wrote [${written.join(', ') || 'nothing'}]` +
+          (skipped.length ? `, kept existing [${skipped.join(', ')}]` : '') +
+          (attempt === 2 ? ' (on retry)' : '');
+        log(message);
+        return { ok: true, written, skipped, attempts: attempt, message };
+      } finally {
+        if (inTransaction) {
+          try {
+            db.exec('ROLLBACK');
+          } catch {
+            /* already committed or no transaction */
+          }
+        }
+        db.close();
+      }
+    } catch (err) {
+      lastError = `MBTiles metadata repair failed (attempt ${attempt}/2): ${
+        err instanceof Error ? err.message : String(err)
+      }`;
+      log(lastError);
+    }
+  }
+
+  return {
+    ok: false,
+    written: [],
+    skipped: [],
+    attempts: 2,
+    message: lastError || 'MBTiles metadata repair failed (unknown reason)'
   };
 }
 

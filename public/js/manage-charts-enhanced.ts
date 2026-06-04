@@ -23,6 +23,27 @@ interface LocalChartsResponse {
   basePath?: string;
 }
 
+interface RepairableChart {
+  identifier: string;
+  filePath: string;
+  relativePath: string;
+  name: string;
+  reason: string;
+  hasTiles: boolean;
+  derived: {
+    bounds: number[];
+    minzoom: number;
+    maxzoom: number;
+    format: string;
+    tileSize?: number;
+  } | null;
+}
+
+interface RepairableChartsResponse {
+  repairable?: RepairableChart[];
+  basePath?: string;
+}
+
 interface ChartMetadata {
   name?: string;
   description?: string;
@@ -57,6 +78,7 @@ interface DuplicateWarningOptions {
 
 // State management
 let chartsData: ManageChart[] = [];
+let repairableData: RepairableChart[] = [];
 let foldersData: string[] = [];
 let basePath = '';
 let selectedFolder: string | null = null; // null means show all folders
@@ -69,6 +91,7 @@ let pendingDeleteConfirm: (() => void | Promise<void>) | null = null;
 let pendingDuplicateConfirm: (() => void | Promise<void>) | null = null;
 let pendingDuplicateCancel: (() => void) | null = null;
 let pendingRename: { chartPath: string; currentName: string; folder: string } | null = null;
+let pendingRepair: { chartPath: string; name: string } | null = null;
 
 window.handleManageTabActive = function (): void {
   void loadCharts();
@@ -96,6 +119,11 @@ async function loadCharts(silent = false): Promise<void> {
     foldersData = data.folders ?? [];
     basePath = data.basePath ?? '';
 
+    // Surface charts the loader dropped for missing bounds but that can be
+    // repaired. Tolerant of failure — a problem here must not break the
+    // normal listing.
+    repairableData = await fetchRepairableCharts();
+
     renderChartsUI();
     setupAutoRefresh();
   } catch (error) {
@@ -111,6 +139,95 @@ async function loadCharts(silent = false): Promise<void> {
       `;
     }
   }
+}
+
+async function fetchRepairableCharts(): Promise<RepairableChart[]> {
+  try {
+    const response = await fetch(`${MANAGE_API_BASE}/repairable-charts`);
+    if (!response.ok) {
+      return [];
+    }
+    const data = (await response.json()) as RepairableChartsResponse;
+    return data.repairable ?? [];
+  } catch {
+    return [];
+  }
+}
+
+function renderRepairableSection(): string {
+  if (repairableData.length === 0) {
+    return '';
+  }
+
+  let html = `
+    <div class="repairable-section" style="margin-bottom: 24px; border: 1px solid var(--border-color); border-radius: 8px; padding: 16px; background: rgba(255, 193, 7, 0.06);">
+      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+        ${window.getIcon('warning')}
+        <strong>Charts needing repair (${repairableData.length})</strong>
+      </div>
+      <p style="font-size: 0.9rem; color: var(--text-secondary); margin: 0 0 12px;">
+        These MBTiles have valid tiles but are missing the <code>bounds</code> metadata, so they
+        aren't served. Repair writes the missing metadata (derived from the tiles) into the file.
+      </p>
+      <div class="chart-${viewMode}">`;
+
+  repairableData.forEach((rc) => {
+    html += renderRepairableCard(rc);
+  });
+
+  html += `
+      </div>
+    </div>`;
+  return html;
+}
+
+function renderRepairableCard(rc: RepairableChart): string {
+  const attrPath = manageEscapeAttr(rc.relativePath);
+  const attrName = manageEscapeAttr(rc.name);
+  const d = rc.derived;
+  const boundsStr = d ? d.bounds.map((n) => n.toFixed(4)).join(', ') : 'unknown';
+  const zoomStr = d ? `${d.minzoom}–${d.maxzoom}` : 'unknown';
+  const formatStr = d ? d.format : 'unknown';
+  const tileSizeNote =
+    d && d.tileSize !== undefined && d.tileSize !== 256
+      ? `<div class="chart-meta-item" style="color: var(--accent-warning, #c77700);">
+           <span class="meta-label">${window.getIcon('warning')} Tile size:</span>
+           <span>${d.tileSize}px (may render mis-scaled in Freeboard)</span>
+         </div>`
+      : '';
+
+  return `
+    <div class="chart-card repairable-card">
+      <div class="chart-card-header">
+        <div class="chart-title" title="${attrName}">${manageEscapeHtml(rc.name)}</div>
+      </div>
+      <div class="chart-card-body">
+        <div class="chart-meta-item">
+          <span class="meta-label">${window.getIcon('folder')} Path:</span>
+          <span>${manageEscapeHtml(rc.relativePath)}</span>
+        </div>
+        <div class="chart-meta-item">
+          <span class="meta-label">Bounds:</span>
+          <span>${manageEscapeHtml(boundsStr)}</span>
+        </div>
+        <div class="chart-meta-item">
+          <span class="meta-label">Zoom:</span>
+          <span>${manageEscapeHtml(zoomStr)}</span>
+        </div>
+        <div class="chart-meta-item">
+          <span class="meta-label">Format:</span>
+          <span>${manageEscapeHtml(formatStr)}</span>
+        </div>
+        ${tileSizeNote}
+      </div>
+      <div class="chart-card-actions">
+        <button class="btn btn-primary" onclick="showRepairDialog('${attrPath}', '${attrName}')" ${
+          d ? '' : 'disabled'
+        }>
+          Repair
+        </button>
+      </div>
+    </div>`;
 }
 
 function setupAutoRefresh(): void {
@@ -188,7 +305,14 @@ function renderChartsUI(): void {
 
   if (chartsData.length === 0) {
     selectedFolder = '/';
-    manageOutput.innerHTML = `
+    // Repairable charts have no card in the normal grid (they're dropped by
+    // the loader), so when there are no served charts at all we still show
+    // them above the welcome state — otherwise the user's only chart would
+    // be invisible with no way to fix it.
+    const repairableHtml = renderRepairableSection();
+    manageOutput.innerHTML =
+      repairableHtml +
+      `
       <div class="empty-state">
         <div class="empty-state-icon">
           <svg viewBox="0 0 24 24" width="80" height="80" fill="none" stroke="currentColor" stroke-width="2">
@@ -248,6 +372,10 @@ function renderChartsUI(): void {
       </div>
     </div>
   `;
+
+  // Repairable charts (dropped by the loader for missing bounds) — shown
+  // above the served grid so the user can fix them.
+  html += renderRepairableSection();
 
   // Folder navigation
   if (foldersData.length > 1) {
@@ -1283,6 +1411,87 @@ async function confirmRename(): Promise<void> {
   }
 }
 
+function showRepairDialog(chartPath: string, name: string): void {
+  const rc = repairableData.find((r) => r.relativePath === chartPath);
+  const d = rc?.derived ?? null;
+  const boundsStr = d ? d.bounds.map((n) => n.toFixed(4)).join(', ') : 'unknown';
+  const tileSizeWarning =
+    d && d.tileSize !== undefined && d.tileSize !== 256
+      ? `<div class="delete-modal-warning">${window.getIcon('warning')} This chart uses ${d.tileSize}px tiles. Freeboard-SK renders charts at 256px and may show it mis-scaled until Freeboard adds tile-size support.</div>`
+      : '';
+
+  const modalHTML = `
+    <div class="delete-modal-overlay" id="repairModal" onclick="closeRepairModal(event)">
+      <div class="delete-modal" onclick="event.stopPropagation()">
+        <div class="delete-modal-header">
+          <div class="delete-modal-icon" style="color: var(--accent-primary);">
+            ${window.getIcon('warning')}
+          </div>
+          <h3>Repair Chart</h3>
+        </div>
+        <div class="delete-modal-body">
+          <p style="margin-bottom: 12px;">
+            Write the missing metadata into <strong>${manageEscapeHtml(name)}</strong> so it can be served?
+          </p>
+          <p style="font-size: 0.9rem; color: var(--text-secondary); margin: 0 0 8px;">
+            The following will be written (derived from the chart's tiles; existing values are kept):
+          </p>
+          <ul style="font-size: 0.9rem; color: var(--text-secondary); margin: 0 0 8px; padding-left: 20px;">
+            <li>bounds: ${manageEscapeHtml(boundsStr)}</li>
+            <li>zoom: ${d ? `${d.minzoom}–${d.maxzoom}` : 'unknown'}</li>
+            <li>format: ${manageEscapeHtml(d ? d.format : 'unknown')}</li>
+          </ul>
+          ${tileSizeWarning}
+        </div>
+        <div class="delete-modal-actions">
+          <button class="btn btn-secondary" onclick="closeRepairModal()">Cancel</button>
+          <button class="btn btn-primary" onclick="confirmRepair()">Repair</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  pendingRepair = { chartPath, name };
+  document.body.insertAdjacentHTML('beforeend', modalHTML);
+}
+
+function closeRepairModal(event?: Event): void {
+  if (event && (event.target as HTMLElement).id !== 'repairModal') {
+    return;
+  }
+  document.getElementById('repairModal')?.remove();
+  pendingRepair = null;
+}
+
+async function confirmRepair(): Promise<void> {
+  if (!pendingRepair) {
+    return;
+  }
+  const { chartPath, name } = pendingRepair;
+  closeRepairModal();
+
+  try {
+    const response = await fetch(`${MANAGE_API_BASE}/repair-chart`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chartPath })
+    });
+
+    if (response.ok) {
+      document.dispatchEvent(new CustomEvent('charts-changed'));
+      void loadCharts();
+      showRepairNotification(name);
+    } else {
+      const errorText = await response.text();
+      showErrorNotification(`Failed to repair chart: ${errorText}`);
+    }
+  } catch (error) {
+    console.error('Error repairing chart:', error);
+    const message = error instanceof Error ? error.message : String(error);
+    showErrorNotification('Error repairing chart: ' + message);
+  }
+}
+
 function deleteFolder(folder: string): void {
   const folderHasCharts = chartsData.some((chart) => chart.folder === folder);
 
@@ -1487,6 +1696,23 @@ function showRenameNotification(oldName: string, newName: string): void {
     </div>
   `;
   fadeOutNotification('renameNotification', html);
+}
+
+function showRepairNotification(name: string): void {
+  const html = `
+    <div class="notification-toast" id="repairNotification">
+      <div class="notification-content">
+        <div class="notification-icon success">
+          ${window.getIcon('checkmark')}
+        </div>
+        <div class="notification-text">
+          <div class="notification-title">Chart Repaired</div>
+          <div class="notification-message">${manageEscapeHtml(name)} is now served</div>
+        </div>
+      </div>
+    </div>
+  `;
+  fadeOutNotification('repairNotification', html);
 }
 
 function showUploadNotification(fileCount: number): void {
@@ -1798,6 +2024,9 @@ window.confirmCreateFolder = confirmCreateFolder;
 window.showRenameDialog = showRenameDialog;
 window.closeRenameModal = closeRenameModal;
 window.confirmRename = confirmRename;
+window.showRepairDialog = showRepairDialog;
+window.closeRepairModal = closeRepairModal;
+window.confirmRepair = confirmRepair;
 window.deleteFolder = deleteFolder;
 window.closeDeleteModal = closeDeleteModal;
 window.confirmDelete = confirmDelete;
