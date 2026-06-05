@@ -922,9 +922,20 @@ async function runPerBandPipeline(
     fs.mkdirSync(bandEncDir, { recursive: true });
     fs.mkdirSync(bandGeojsonDir, { recursive: true });
     // Container runs as UID 1001 (toolbox user); host-created dirs default
-    // to 0o755 owned by the host process UID. Chmod to 0o777 so the container
-    // can write GeoJSON output and error logs.
-    fs.chmodSync(bandGeojsonDir, 0o777);
+    // to 0o755 owned by the host process UID. Transfer ownership to the
+    // container user if possible, otherwise fall back to world-writable.
+    try {
+      fs.chownSync(bandGeojsonDir, 1001, -1);
+      fs.chmodSync(bandGeojsonDir, 0o755);
+    } catch (err) {
+      // Host process lacks CAP_CHOWN; fall back to world-writable so
+      // the container can still write output.
+      if ((err as NodeJS.ErrnoException).code === 'EPERM') {
+        fs.chmodSync(bandGeojsonDir, 0o777);
+      } else {
+        throw err;
+      }
+    }
 
     // Hardlink each cell into the band-scoped dir so the export
     // script (which walks `find <inDir> -name '*.000'`) only sees
@@ -980,9 +991,21 @@ async function runPerBandPipeline(
     fs.mkdirSync(unbandedEncDir, { recursive: true });
     fs.mkdirSync(unbandedGeojsonDir, { recursive: true });
     // Container runs as UID 1001 (toolbox user); host-created dirs default
-    // to 0o755 owned by the host process UID. Chmod to 0o777 so the container
-    // can write GeoJSON output and error logs.
-    fs.chmodSync(unbandedGeojsonDir, 0o777);
+    // to 0o755 owned by the host process UID. Transfer ownership to the
+    // container user if possible, otherwise fall back to world-writable.
+    try {
+      fs.chownSync(unbandedGeojsonDir, 1001, -1);
+      fs.chmodSync(unbandedGeojsonDir, 0o755);
+    } catch (err) {
+      // Host process lacks CAP_CHOWN; fall back to world-writable so
+      // the container can still write output.
+      if ((err as NodeJS.ErrnoException).code === 'EPERM') {
+        fs.chmodSync(unbandedGeojsonDir, 0o777);
+      } else {
+        throw err;
+      }
+    }
+
     // Hardlink (not symlink) — see the band-loop above for the
     // why: bind-mounted absolute symlink targets don't resolve
     // inside the helper container.
@@ -1056,9 +1079,20 @@ export async function processS57Zip(
   fs.mkdirSync(encDir, { recursive: true });
   fs.mkdirSync(geojsonDir, { recursive: true });
   // Container runs as UID 1001 (toolbox user); host-created dirs default
-  // to 0o755 owned by the host process UID. Chmod to 0o777 so the container
-  // can write GeoJSON output and error logs.
-  fs.chmodSync(geojsonDir, 0o777);
+  // to 0o755 owned by the host process UID. Transfer ownership to the
+  // container user if possible, otherwise fall back to world-writable.
+  try {
+    fs.chownSync(geojsonDir, 1001, -1);
+    fs.chmodSync(geojsonDir, 0o755);
+  } catch (err) {
+    // Host process lacks CAP_CHOWN; fall back to world-writable so
+    // the container can still write output.
+    if ((err as NodeJS.ErrnoException).code === 'EPERM') {
+      fs.chmodSync(geojsonDir, 0o777);
+    } else {
+      throw err;
+    }
+  }
 
   if (chartNumber) {
     conversionProgress[chartNumber] = {
