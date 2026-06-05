@@ -46,7 +46,8 @@ function startOrigin(handler: (hit: number, res: http.ServerResponse) => void): 
   });
 }
 
-// Resolve when the given job reaches a terminal state.
+// Resolve when the given job reaches a terminal state (completed / failed /
+// cancelled). A cancelled job is emitted via job-cancelled by cancelJob().
 function waitForTerminal(jobId: string): Promise<DownloadJob> {
   return new Promise((resolve) => {
     const check = (job: DownloadJob): void => {
@@ -56,11 +57,13 @@ function waitForTerminal(jobId: string): Promise<DownloadJob> {
       if (job.status === 'completed' || job.status === 'failed') {
         downloadManager.removeListener('job-completed', check);
         downloadManager.removeListener('job-failed', check);
+        downloadManager.removeListener('job-cancelled', check);
         resolve(job);
       }
     };
     downloadManager.on('job-completed', check);
     downloadManager.on('job-failed', check);
+    downloadManager.on('job-cancelled', check);
   });
 }
 
@@ -180,6 +183,48 @@ describe('DownloadManager retry', () => {
       assert.strictEqual(job.status, 'failed');
       assert.match(job.error ?? '', /500/);
       assert.strictEqual(origin.hits(), 3, 'should stop after MAX_DOWNLOAD_ATTEMPTS (3)');
+    } finally {
+      await origin.close();
+    }
+  });
+
+  it('does not retry (or complete) a job cancelled during backoff', async () => {
+    // First attempt 503 (→ enters backoff); cancel during the backoff window.
+    // The retry must NOT run a second attempt, and the job must stay cancelled
+    // — never overwritten by a later completion.
+    let secondAttempt = false;
+    const origin = await startOrigin((hit, res) => {
+      if (hit === 1) {
+        res.statusCode = 503;
+        res.end('busy');
+        return;
+      }
+      secondAttempt = true; // would only fire if a retry wrongly proceeded
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/octet-stream');
+      res.end('CHARTDATA');
+    });
+
+    try {
+      const jobId = downloadManager.createJob(origin.url, TMP, 'cancel-in-backoff', {
+        saveRaw: true
+      });
+      // Cancel mid-backoff: after the first 503 (a few hundred ms in) but well
+      // before the ~2s backoff elapses.
+      await new Promise((r) => setTimeout(r, 500));
+      const result = downloadManager.cancelJob(jobId);
+      assert.strictEqual(result.success, true, 'cancel should succeed mid-flight');
+
+      // Wait past the full backoff window so a (wrongly) resumed retry would
+      // have hit the origin and possibly completed the job by now.
+      await new Promise((r) => setTimeout(r, 3000));
+
+      const job = downloadManager.getJob(jobId);
+      assert.ok(job);
+      assert.strictEqual(job.status, 'failed');
+      assert.strictEqual(job.error, 'Cancelled by user', 'cancellation must not be overwritten');
+      assert.strictEqual(secondAttempt, false, 'must not start a retry after cancel');
+      assert.strictEqual(origin.hits(), 1, 'only the first (pre-cancel) attempt should hit');
     } finally {
       await origin.close();
     }

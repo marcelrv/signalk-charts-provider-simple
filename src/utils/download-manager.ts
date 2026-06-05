@@ -23,6 +23,12 @@ export class TransientDownloadError extends Error {
 const MAX_DOWNLOAD_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 2000;
 
+// cancelJob() marks a job failed with this exact error and emits job-cancelled.
+const CANCELLED_ERROR = 'Cancelled by user';
+function isCancelled(job: DownloadJob): boolean {
+  return job.status === 'failed' && job.error === CANCELLED_ERROR;
+}
+
 interface DownloadManagerEvents {
   'job-created': [job: DownloadJob];
   'job-updated': [job: DownloadJob];
@@ -128,6 +134,10 @@ class DownloadManager extends EventEmitter {
   }
 
   private async processJob(job: DownloadJob): Promise<void> {
+    // Cancelled while still queued — don't resurrect it into 'downloading'.
+    if (isCancelled(job)) {
+      return;
+    }
     try {
       job.status = 'downloading';
       job.startedAt = Date.now();
@@ -140,6 +150,11 @@ class DownloadManager extends EventEmitter {
       job.completedAt = Date.now();
       this.emit('job-completed', job);
     } catch (error) {
+      // A cancelled job is already in its terminal state (cancelJob set it and
+      // emitted job-cancelled); don't overwrite or re-emit job-failed.
+      if (isCancelled(job)) {
+        return;
+      }
       job.status = 'failed';
       job.error = (error instanceof Error ? error.message : String(error)) || 'Download failed';
       job.completedAt = Date.now();
@@ -171,10 +186,20 @@ class DownloadManager extends EventEmitter {
   private async downloadWithRetry(job: DownloadJob): Promise<void> {
     const originalUrl = job.originalUrl ?? job.url;
     for (let attempt = 1; attempt <= MAX_DOWNLOAD_ATTEMPTS; attempt++) {
+      // cancelJob() marks the job failed/'Cancelled by user' but can't abort an
+      // in-flight attempt or the backoff timer. Bail before (re)starting so a
+      // cancel during a download or backoff isn't overwritten by a later
+      // success in processJob.
+      if (isCancelled(job)) {
+        throw new Error('Cancelled by user');
+      }
       try {
         await this.downloadAndExtract(job);
         return;
       } catch (error) {
+        if (isCancelled(job)) {
+          throw new Error('Cancelled by user');
+        }
         const transient = error instanceof TransientDownloadError;
         if (!transient || attempt === MAX_DOWNLOAD_ATTEMPTS) {
           throw error;
@@ -187,6 +212,10 @@ class DownloadManager extends EventEmitter {
         job.url = originalUrl;
         job.downloadedBytes = 0;
         job.progress = 0;
+        // A prior attempt may have flipped status to 'extracting' (zip ≥90%);
+        // the retry starts in the download phase again, so reset it or the UI
+        // shows "0% extracting".
+        job.status = 'downloading';
         // downloadAndExtract pushes onto these as files/zip-entries arrive, so
         // clear them (after cleanupPartialFiles has used targetFiles) — else a
         // retry of a partially-streamed download accumulates duplicate names.
