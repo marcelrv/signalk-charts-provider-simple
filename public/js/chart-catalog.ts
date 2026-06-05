@@ -98,6 +98,11 @@ let activeCategoryFilter: CatalogCategory | 'all' = 'all';
 const expandedCatalogs = new Set<string>();
 const catalogChartData: Record<string, CatalogData> = {};
 let catalogFolders: string[] = ['/'];
+
+// Update queue management
+let catalogUpdateQueue: CatalogUpdate[] = [];
+let catalogUpdateQueueIndex = -1;
+let catalogUpdateQueueRunning = false;
 const catalogDownloadJobs: Record<string, string> = {};
 let catalogConverting: Record<string, boolean> = {};
 let catalogConversionProgress: Record<string, ConversionProgress> = {};
@@ -321,20 +326,25 @@ function wireCatalogClickHandlers(): void {
         return;
       }
 
-      // "Update All" button
+      // "Update All" button - queue updates for sequential processing
       const updateAll = target.closest<HTMLElement>('[data-catalog-update-all]');
       if (updateAll) {
+        const updatesToQueue: CatalogUpdate[] = [];
         for (const update of catalogUpdates) {
           const alreadyActive =
             catalogDownloadJobs[update.chartNumber] !== undefined ||
             catalogConverting[update.chartNumber];
           if (!alreadyActive) {
-            const folderEl = document.getElementById(
-              `catalog-update-folder-${catalogEscapeId(update.chartNumber)}`
-            ) as HTMLSelectElement | null;
-            const targetFolder = folderEl ? folderEl.value : update.installedFolder;
-            void downloadUpdateChart(update, targetFolder);
+            updatesToQueue.push(update);
           }
+        }
+        
+        if (updatesToQueue.length > 0) {
+          catalogUpdateQueue = updatesToQueue;
+          catalogUpdateQueueIndex = 0;
+          catalogUpdateQueueRunning = true;
+          renderUpdatesSection();
+          void processUpdateQueue();
         }
         return;
       }
@@ -488,13 +498,43 @@ function renderUpdatesSection(): void {
       const isUpdating =
         catalogDownloadJobs[update.chartNumber] !== undefined ||
         catalogConverting[update.chartNumber];
+      const conversionError = catalogConversionErrors[update.chartNumber];
+      const isDownloading = catalogDownloadJobs[update.chartNumber] !== undefined;
+      const queuePosition = getQueuePosition(update.chartNumber);
+      const isInQueue = queuePosition !== null;
+      const isWaiting = queuePosition !== null && queuePosition > 0;
 
-      const actionHtml = isUpdating
-        ? `<div class="catalog-update-row-updating">
-            <div class="spinner" style="width:16px;height:16px;border-width:2px;flex-shrink:0;"></div>
-            <span>Updating…</span>
-           </div>`
-        : `<select class="catalog-folder-select catalog-update-folder-select" id="catalog-update-folder-${escapedNum}">
+      let actionHtml = '';
+      if (conversionError) {
+        actionHtml = `
+          <div class="catalog-conversion-error">
+            <span class="conversion-error-text">${catalogEscapeHtml(conversionError)}</span>
+            <button class="btn-catalog-log" data-catalog-log="${catalogEscapeAttr(update.chartNumber)}">Logs</button>
+            <button class="btn-catalog-dismiss" data-catalog-dismiss="${catalogEscapeAttr(update.chartNumber)}">Dismiss</button>
+          </div>`;
+      } else if (isWaiting) {
+        actionHtml = `
+          <div class="catalog-queue-waiting">
+            <div class="spinner" style="width:16px;height:16px;border-width:2px;opacity:0.5;"></div>
+            <span>Waiting in queue (position ${queuePosition})...</span>
+          </div>`;
+      } else if (isDownloading) {
+        actionHtml = `
+          <div class="catalog-download-progress" id="catalog-progress-${escapedNum}">
+            <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
+            <span>Downloading...</span>
+          </div>`;
+      } else if (isUpdating) {
+        const progress = catalogConversionProgress[update.chartNumber];
+        const progressMsg = progress?.message ?? 'Converting S-57 to vector tiles...';
+        actionHtml = `
+          <div class="catalog-conversion-progress" id="catalog-conversion-${escapedNum}">
+            <div class="spinner" style="width:16px;height:16px;border-width:2px;"></div>
+            <span>${catalogEscapeHtml(progressMsg)}</span>
+            <button class="btn-catalog-log" data-catalog-log="${catalogEscapeAttr(update.chartNumber)}">Logs</button>
+          </div>`;
+      } else {
+        actionHtml = `<select class="catalog-folder-select catalog-update-folder-select" id="catalog-update-folder-${escapedNum}">
             ${buildFolderOptions(update.installedFolder)}
            </select>
            <button class="btn-catalog-download"
@@ -504,9 +544,10 @@ function renderUpdatesSection(): void {
                    data-catalog-update-datetime="${catalogEscapeAttr(update.availableDate)}">
              Update
            </button>`;
+      }
 
       return `
-        <div class="catalog-update-row${isUpdating ? ' updating' : ''}" data-chart-number="${catalogEscapeAttr(update.chartNumber)}">
+        <div class="catalog-update-row${isUpdating || isInQueue ? ' updating' : ''}" data-chart-number="${catalogEscapeAttr(update.chartNumber)}">
           <div class="catalog-update-row-info">
             <span class="catalog-update-row-title">${catalogEscapeHtml(update.title || update.chartNumber)}</span>
             <span class="catalog-update-row-dates">${catalogEscapeHtml(installedDateStr)} → ${catalogEscapeHtml(availableDateStr)}</span>
@@ -520,8 +561,21 @@ function renderUpdatesSection(): void {
 
   const allUpdating = catalogUpdates.every(
     (u) =>
-      catalogDownloadJobs[u.chartNumber] !== undefined || catalogConverting[u.chartNumber]
+      catalogDownloadJobs[u.chartNumber] !== undefined ||
+      catalogConverting[u.chartNumber] ||
+      catalogConversionErrors[u.chartNumber]
   );
+
+  // Show queue progress in the button
+  let updateAllButtonText = 'Update All';
+  let updateAllDisabled = allUpdating;
+  
+  if (catalogUpdateQueueRunning && catalogUpdateQueueIndex >= 0) {
+    const current = catalogUpdateQueueIndex + 1;
+    const total = catalogUpdateQueue.length;
+    updateAllButtonText = `Updating ${current} of ${total}...`;
+    updateAllDisabled = true;
+  }
 
   section.innerHTML = `
     <div class="catalog-updates-section">
@@ -529,9 +583,9 @@ function renderUpdatesSection(): void {
         <span class="catalog-updates-title">
           ${catalogUpdates.length} chart update${catalogUpdates.length !== 1 ? 's' : ''} available
         </span>
-        <button class="btn-catalog-download" ${allUpdating ? 'disabled' : ''}
+        <button class="btn-catalog-download" ${updateAllDisabled ? 'disabled' : ''}
                 data-catalog-update-all>
-          Update All
+          ${updateAllButtonText}
         </button>
       </div>
       <div class="catalog-updates-rows">
@@ -583,6 +637,87 @@ async function downloadUpdateChart(
     console.error('Failed to start chart update:', error);
     alert('Failed to start update. Check your network connection.');
   }
+}
+
+/**
+ * Process the update queue sequentially
+ */
+async function processUpdateQueue(): Promise<void> {
+  if (!catalogUpdateQueueRunning || catalogUpdateQueueIndex >= catalogUpdateQueue.length) {
+    // Queue complete
+    catalogUpdateQueue = [];
+    catalogUpdateQueueIndex = -1;
+    catalogUpdateQueueRunning = false;
+    renderUpdatesSection();
+    return;
+  }
+
+  const update = catalogUpdateQueue[catalogUpdateQueueIndex];
+  const folderEl = document.getElementById(
+    `catalog-update-folder-${catalogEscapeId(update.chartNumber)}`
+  ) as HTMLSelectElement | null;
+  const targetFolder = folderEl ? folderEl.value : update.installedFolder;
+
+  // Start the update
+  await downloadUpdateChart(update, targetFolder);
+
+  // Wait for this conversion to complete
+  await waitForConversion(update.chartNumber);
+
+  // Move to next item
+  catalogUpdateQueueIndex++;
+  renderUpdatesSection();
+
+  // Process next item
+  await processUpdateQueue();
+}
+
+/**
+ * Check if a chart is in the update queue
+ */
+function getQueuePosition(chartNumber: string): number | null {
+  if (!catalogUpdateQueueRunning) {
+    return null;
+  }
+  const index = catalogUpdateQueue.findIndex(u => u.chartNumber === chartNumber);
+  if (index === -1) {
+    return null;
+  }
+  return index - catalogUpdateQueueIndex; // 0 = currently processing, >0 = waiting
+}
+
+/**
+ * Poll until a chart's conversion is complete (success or failure)
+ */
+async function waitForConversion(chartNumber: string): Promise<void> {
+  const maxWait = 10 * 60 * 1000; // 10 minutes max
+  const pollInterval = 2000; // 2 seconds
+  const startTime = Date.now();
+  
+  while (Date.now() - startTime < maxWait) {
+    // Check if still downloading
+    if (catalogDownloadJobs[chartNumber] !== undefined) {
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
+      continue;
+    }
+    
+    // Check if still converting
+    if (catalogConverting[chartNumber]) {
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
+      continue;
+    }
+    
+    // Check if there's an error (conversion failed)
+    if (catalogConversionErrors[chartNumber]) {
+      return; // Conversion failed, stop waiting
+    }
+    
+    // If we get here, the conversion is complete (no longer in any tracking map)
+    return;
+  }
+  
+  // Timeout - conversion took too long
+  console.warn(`Conversion for ${chartNumber} timed out after 10 minutes`);
 }
 
 function renderFilterBar(): void {
@@ -675,11 +810,13 @@ async function toggleCatalog(catalogFile: string): Promise<void> {
   if (expandedCatalogs.has(catalogFile)) {
     expandedCatalogs.delete(catalogFile);
     renderCatalogList();
+    renderUpdatesSection();
     return;
   }
 
   expandedCatalogs.add(catalogFile);
   renderCatalogList();
+  renderUpdatesSection();
 
   // Load chart data if not already cached
   if (!catalogChartData[catalogFile]) {

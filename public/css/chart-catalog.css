@@ -452,12 +452,17 @@ option.catalog-folder-option-new {
  * has a thin bar.  Two separate classes so pollConversions can update the
  * conversion pill without touching the download pill.  */
 .catalog-download-progress,
-.catalog-conversion-progress {
+.catalog-conversion-progress,
+.catalog-queue-waiting {
     display: flex;
     align-items: center;
     gap: var(--md-sys-spacing-2);
     font-size: 12px;
     color: var(--md-sys-color-on-surface-variant);
+}
+
+.catalog-queue-waiting {
+    opacity: 0.6;
 }
 
 .catalog-download-progress .progress-bar {

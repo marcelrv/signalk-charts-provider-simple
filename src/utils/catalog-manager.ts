@@ -583,11 +583,13 @@ export function checkForUpdates(chartPath: string): CatalogUpdate[] {
     ) {
       let installedFolder = '/';
       if (install.installedFilename) {
-        const rel = path.relative(chartPath, path.dirname(install.installedFilename));
-        // path.relative returns '' when the file is in chartPath root,
-        // and something like '../foo' when outside — treat both as root.
-        if (rel && !rel.startsWith('..') && rel !== '.') {
-          installedFolder = rel;
+        // installedFilename is already relative to chartPath (stored by
+        // setInstallFilename), so just extract the directory portion.
+        const folder = path.dirname(install.installedFilename);
+        // path.dirname returns '.' when the file is in the root folder,
+        // and could return '../foo' if somehow stored outside — treat both as root.
+        if (folder && folder !== '.' && !folder.startsWith('..')) {
+          installedFolder = folder;
         }
       }
       updates.push({
