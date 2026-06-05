@@ -36,6 +36,10 @@ const QUARANTINE_ROOT_NAME = 'in-progress';
 export function makeQuarantineDir(dataDir: string, chartNumber: string): string {
   const dir = path.join(dataDir, QUARANTINE_ROOT_NAME, sanitizeIdSegment(chartNumber));
   fs.mkdirSync(dir, { recursive: true });
+  // Container runs as UID 1001 (toolbox user); host-created dirs default
+  // to 0o755 owned by the host process UID. Chmod to 0o777 so the container
+  // can write .mbtiles output files.
+  fs.chmodSync(dir, 0o777);
   return dir;
 }
 

@@ -1,8 +1,17 @@
-import https from 'https';
 import fs from 'fs';
-import path from 'path';
+import https from 'https';
 import { DatabaseSync } from 'node:sqlite';
+import path from 'path';
 import unzipper from 'unzipper';
+import type {
+  ConversionProgress,
+  ConversionProgressMap,
+  DebugFunction,
+  S57ConversionOptions,
+  S57ConversionResult,
+  StatusCallback
+} from '../types.js';
+import { sanitizeChartFilename } from './catalog-title.js';
 import { getCpuBudget } from './concurrency.js';
 import { CHARTS_TOOLBOX_IMAGE } from './container-images.js';
 import {
@@ -11,6 +20,7 @@ import {
   runJob as runContainerJob
 } from './container-jobs.js';
 import { getContainerManager } from './container-manager.js';
+import { patchS57Mbtiles, setMbtilesDisplayName } from './mbtiles-metadata.js';
 import {
   BAND_MAX_ZOOM,
   BAND_MIN_ZOOM,
@@ -18,16 +28,6 @@ import {
   groupCellsByBand,
   highestBandForFiles
 } from './s57-band.js';
-import { patchS57Mbtiles, setMbtilesDisplayName } from './mbtiles-metadata.js';
-import { sanitizeChartFilename } from './catalog-title.js';
-import type {
-  ConversionProgress,
-  ConversionProgressMap,
-  S57ConversionResult,
-  S57ConversionOptions,
-  StatusCallback,
-  DebugFunction
-} from '../types.js';
 
 const conversionProgress: ConversionProgressMap = {};
 const MAX_LOG_LINES = 100;
@@ -235,7 +235,7 @@ export function buildExportScript(opts: ExportScriptOptions): string {
   if (parallel === 1) {
     return `
 set -e
-: > ${errLog}
+: > "${errLog}" 2>/dev/null || true
 count=$(find ${inDir} -name '*.000' ! -name '._*' -type f | wc -l)
 i=0
 find ${inDir} -name '*.000' ! -name '._*' -type f -print0 | while IFS= read -r -d '' enc; do
@@ -264,7 +264,7 @@ echo "PROGRESS: Export complete"
   const multiArg = opts.multiFile ? '1' : '0';
   return `
 set -e
-: > ${errLog}
+: > "${errLog}" 2>/dev/null || true
 count=$(find ${inDir} -name '*.000' ! -name '._*' -type f | wc -l)
 i=0
 find ${inDir} -name '*.000' ! -name '._*' -type f -print0 | while IFS= read -r -d '' enc; do
@@ -921,6 +921,10 @@ async function runPerBandPipeline(
     const bandGeojsonDir = path.join(tmpDir, `geojson-band-${band}`);
     fs.mkdirSync(bandEncDir, { recursive: true });
     fs.mkdirSync(bandGeojsonDir, { recursive: true });
+    // Container runs as UID 1001 (toolbox user); host-created dirs default
+    // to 0o755 owned by the host process UID. Chmod to 0o777 so the container
+    // can write GeoJSON output and error logs.
+    fs.chmodSync(bandGeojsonDir, 0o777);
 
     // Hardlink each cell into the band-scoped dir so the export
     // script (which walks `find <inDir> -name '*.000'`) only sees
@@ -975,6 +979,10 @@ async function runPerBandPipeline(
     const unbandedGeojsonDir = path.join(tmpDir, 'geojson-unbanded');
     fs.mkdirSync(unbandedEncDir, { recursive: true });
     fs.mkdirSync(unbandedGeojsonDir, { recursive: true });
+    // Container runs as UID 1001 (toolbox user); host-created dirs default
+    // to 0o755 owned by the host process UID. Chmod to 0o777 so the container
+    // can write GeoJSON output and error logs.
+    fs.chmodSync(unbandedGeojsonDir, 0o777);
     // Hardlink (not symlink) — see the band-loop above for the
     // why: bind-mounted absolute symlink targets don't resolve
     // inside the helper container.
@@ -1047,6 +1055,10 @@ export async function processS57Zip(
   const geojsonDir = path.join(tmpDir, 'geojson');
   fs.mkdirSync(encDir, { recursive: true });
   fs.mkdirSync(geojsonDir, { recursive: true });
+  // Container runs as UID 1001 (toolbox user); host-created dirs default
+  // to 0o755 owned by the host process UID. Chmod to 0o777 so the container
+  // can write GeoJSON output and error logs.
+  fs.chmodSync(geojsonDir, 0o777);
 
   if (chartNumber) {
     conversionProgress[chartNumber] = {
