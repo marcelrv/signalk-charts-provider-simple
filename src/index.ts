@@ -1833,7 +1833,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
 
     router.get('/catalog-updates', (_req: Request, res: Response) => {
       try {
-        const updates = checkForUpdates(props.chartPath || defaultChartsPath);
+        const updates = checkForUpdates();
         res.json(updates);
       } catch (error) {
         console.error('Error checking catalog updates:', error);
@@ -2870,7 +2870,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
           await fetchCatalog(catalogFile);
         }
 
-        const updates = checkForUpdates(props.chartPath || defaultChartsPath);
+        const updates = checkForUpdates();
         if (updates.length > 0) {
           app.debug(`Found ${updates.length} chart update(s) available from catalog`);
           if (props.disableUpdateNotifications) {
