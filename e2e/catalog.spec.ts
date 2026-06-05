@@ -160,8 +160,9 @@ test.describe('Chart Catalog tab', () => {
     await expect(errorText).toBeVisible();
     await expect(errorText).toContainText(/mock download failure/i);
 
-    // Dismiss must clear it from the panel (the Dismiss button under
-    // #catalogUpdatesSection is wired and re-renders the section).
+    // Dismiss must clear the error from the panel — the row itself stays in
+    // the DOM, only the error message is removed. The Dismiss button under
+    // #catalogUpdatesSection is wired and re-renders the section.
     await row.locator('[data-catalog-dismiss="1"]').click();
     await expect(row.locator('.conversion-error-text')).toHaveCount(0);
   });
