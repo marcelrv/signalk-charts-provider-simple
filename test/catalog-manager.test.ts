@@ -15,6 +15,7 @@ import {
   trackInstall,
   setInstallFilename,
   removeInstall,
+  rollbackInstall,
   getInstalledCatalogCharts,
   checkForUpdates,
   getCatalogsWithInstalledCharts,
@@ -342,7 +343,130 @@ describe('CatalogManager', () => {
       setInstallFilename('folder_chart', '/var/charts/folder_chart.mbtiles');
       assert.strictEqual(checkForUpdates()[0]!.installedFolder, '/');
 
+      // An embedded traversal segment must collapse to root.
+      setInstallFilename('folder_chart', 'Europe/../../etc/folder_chart.mbtiles');
+      assert.strictEqual(checkForUpdates()[0]!.installedFolder, '/');
+
+      // A Windows drive-prefixed path must collapse to root.
+      setInstallFilename('folder_chart', 'C:\\charts\\folder_chart.mbtiles');
+      assert.strictEqual(checkForUpdates()[0]!.installedFolder, '/');
+
       removeInstall('folder_chart');
+    });
+  });
+
+  describe('rollbackInstall() / issue #120', () => {
+    const CACHE_FILE = 'NOAA_MBTiles_Catalog.json';
+    const CATALOG = 'NOAA_MBTiles_Catalog.xml';
+
+    // Write a cache that advertises `availableDate` for `chartNumber` so
+    // checkForUpdates() can compare against the tracked install date.
+    function seedCache(chartNumber: string, availableDate: string): void {
+      const cacheDir = path.join(TEST_DATA_DIR, 'catalog-cache');
+      fs.writeFileSync(
+        path.join(cacheDir, CACHE_FILE),
+        JSON.stringify({
+          fetchedAt: new Date().toISOString(),
+          catalogFile: CATALOG,
+          header: { title: 'Test' },
+          charts: [
+            {
+              number: chartNumber,
+              title: 'Test Chart',
+              format: 'MBTiles',
+              zipfile_location: 'https://example.com/test.mbtiles',
+              zipfile_datetime_iso8601: availableDate
+            }
+          ]
+        }),
+        'utf-8'
+      );
+    }
+
+    it('deletes the record on a failed FRESH install', () => {
+      trackInstall('fresh', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/a.mbtiles');
+      rollbackInstall('fresh');
+      assert.strictEqual(getInstalledCatalogCharts()['fresh'], undefined);
+    });
+
+    it('restores the prior record on a failed UPDATE', () => {
+      trackInstall('upd', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/old.mbtiles');
+      setInstallFilename('upd', 'Rotterdam.mbtiles');
+      // The update attempt overwrites with a newer date/url...
+      trackInstall('upd', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/new.mbtiles');
+      // ...then fails:
+      rollbackInstall('upd');
+
+      const rec = getInstalledCatalogCharts()['upd'];
+      assert.ok(rec, 'record must survive a failed update');
+      assert.strictEqual(rec.zipfile_datetime_iso8601, '2024-01-01T00:00:00Z');
+      assert.strictEqual(rec.zipfile_location, 'https://example.com/old.mbtiles');
+      assert.strictEqual(rec.installedFilename, 'Rotterdam.mbtiles');
+      removeInstall('upd');
+    });
+
+    it('keeps flagging the update after a failed update (the #120 symptom)', () => {
+      seedCache('enc1', '2024-06-10T00:00:00Z');
+      trackInstall('enc1', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/old.mbtiles');
+      setInstallFilename('enc1', 'enc1.mbtiles');
+      trackInstall('enc1', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/new.mbtiles');
+      rollbackInstall('enc1');
+
+      const updates = checkForUpdates();
+      const u = updates.find((x) => x.chartNumber === 'enc1');
+      assert.ok(u, 'a failed update must still appear as available');
+      assert.strictEqual(u.installedDate, '2024-01-01T00:00:00Z');
+      assert.strictEqual(u.availableDate, '2024-06-10T00:00:00Z');
+      removeInstall('enc1');
+    });
+
+    it('does not resurrect the old record after a successful update', () => {
+      trackInstall('s', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/v1.mbtiles');
+      setInstallFilename('s', 'v1.mbtiles');
+      trackInstall('s', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/v2.mbtiles');
+      setInstallFilename('s', 'v2.mbtiles'); // success clears the snapshot
+      // A stray rollback now must NOT restore v1 (snapshot is gone → removeInstall).
+      rollbackInstall('s');
+      assert.strictEqual(getInstalledCatalogCharts()['s'], undefined);
+    });
+
+    it('restores the original across sequential failed updates', () => {
+      trackInstall('seq', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/v1.mbtiles');
+      setInstallFilename('seq', 'v1.mbtiles');
+      for (const attempt of ['2024-03-01T00:00:00Z', '2024-06-10T00:00:00Z']) {
+        trackInstall('seq', CATALOG, attempt, 'https://example.com/x.mbtiles');
+        rollbackInstall('seq');
+        const rec = getInstalledCatalogCharts()['seq'];
+        assert.ok(rec);
+        assert.strictEqual(rec.zipfile_datetime_iso8601, '2024-01-01T00:00:00Z');
+      }
+      removeInstall('seq');
+    });
+
+    it('falls back to removeInstall when there is no snapshot', () => {
+      assert.doesNotThrow(() => {
+        rollbackInstall('never-tracked');
+      });
+      assert.strictEqual(getInstalledCatalogCharts()['never-tracked'], undefined);
+    });
+
+    it('is keyed exactly and does not fuzzy-match other charts', () => {
+      trackInstall('2', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/2.mbtiles');
+      trackInstall('20', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/20.mbtiles');
+      rollbackInstall('20'); // fresh → deletes '20' only
+      assert.ok(getInstalledCatalogCharts()['2'], "'2' must be untouched by rollback of '20'");
+      assert.strictEqual(getInstalledCatalogCharts()['20'], undefined);
+      removeInstall('2');
+    });
+
+    it('removeInstall clears a pending snapshot so a later rollback cannot resurrect it', () => {
+      trackInstall('d', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/old.mbtiles');
+      setInstallFilename('d', 'd.mbtiles');
+      trackInstall('d', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/new.mbtiles'); // snapshot = old
+      removeInstall('d'); // genuine removal must drop the snapshot
+      trackInstall('d', CATALOG, '2024-09-01T00:00:00Z', 'https://example.com/newer.mbtiles');
+      rollbackInstall('d'); // snapshot here is null (fresh after removeInstall) → deletes
+      assert.strictEqual(getInstalledCatalogCharts()['d'], undefined);
     });
   });
 

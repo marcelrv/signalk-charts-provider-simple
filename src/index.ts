@@ -22,6 +22,7 @@ import {
   removeInstall,
   removeInstallByFilename,
   renameInstallFilename,
+  rollbackInstall,
   setConvertingState,
   setInstallFilename,
   trackInstall
@@ -2210,14 +2211,14 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
             void (async () => {
               try {
                 if (!job.extractedFiles || job.extractedFiles.length === 0) {
-                  removeInstall(chartNumber);
+                  rollbackInstall(chartNumber);
                   app.debug(`Removed catalog tracking for ${chartNumber}: no .mbtiles extracted`);
                   return;
                 }
                 if (job.status !== 'completed') {
                   // Failed downloads leak nothing into the live target;
                   // the quarantine wipe in `finally` handles cleanup.
-                  removeInstall(chartNumber);
+                  rollbackInstall(chartNumber);
                   return;
                 }
                 try {
@@ -2228,7 +2229,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
                       promoteErr instanceof Error ? promoteErr.message : String(promoteErr)
                     }`
                   );
-                  removeInstall(chartNumber);
+                  rollbackInstall(chartNumber);
                   return;
                 }
                 // The global `job-completed` handler enables charts and
@@ -2332,7 +2333,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
 
       if (!zipPath || !fs.existsSync(zipPath)) {
         app.debug(`S-57: no ZIP file found after download for ${chartNumber}`);
-        removeInstall(chartNumber);
+        rollbackInstall(chartNumber);
         cleanupDir(tmpDownloadDir);
         return;
       }
@@ -2393,7 +2394,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
         app.error(
           `S-57 conversion failed for ${chartNumber}: ${convError instanceof Error ? convError.message : String(convError)}`
         );
-        removeInstall(chartNumber);
+        rollbackInstall(chartNumber);
         setConvertingState(chartNumber, false);
         if (quarantineDir !== null) {
           cleanupQuarantineDir(quarantineDir);
@@ -2408,7 +2409,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
       }
       downloadManager.removeListener('job-completed', s57Listener);
       downloadManager.removeListener('job-failed', s57FailListener);
-      removeInstall(chartNumber);
+      rollbackInstall(chartNumber);
       setConvertingState(chartNumber, false);
       setS57Failed(chartNumber, job.error ?? 'Download failed');
       cleanupDir(tmpDownloadDir);
@@ -2452,7 +2453,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
 
       if (!zipPath || !fs.existsSync(zipPath)) {
         app.debug(`RNC: no file found after download for ${chartNumber}`);
-        removeInstall(chartNumber);
+        rollbackInstall(chartNumber);
         cleanupDir(tmpDownloadDir);
         return;
       }
@@ -2507,7 +2508,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
         app.error(
           `RNC conversion failed for ${chartNumber}: ${convError instanceof Error ? convError.message : String(convError)}`
         );
-        removeInstall(chartNumber);
+        rollbackInstall(chartNumber);
         setConvertingState(chartNumber, false);
         if (quarantineDir !== null) {
           cleanupQuarantineDir(quarantineDir);
@@ -2522,7 +2523,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
       }
       downloadManager.removeListener('job-completed', rncListener);
       downloadManager.removeListener('job-failed', rncFailListener);
-      removeInstall(chartNumber);
+      rollbackInstall(chartNumber);
       setConvertingState(chartNumber, false);
       setRncFailed(chartNumber, job.error ?? 'Download failed');
       cleanupDir(tmpDownloadDir);
@@ -2565,7 +2566,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
       const dlPath = dlFileName ? path.join(tmpDownloadDir, dlFileName) : null;
 
       if (!dlPath || !fs.existsSync(dlPath)) {
-        removeInstall(chartNumber);
+        rollbackInstall(chartNumber);
         cleanupDir(tmpDownloadDir);
         return;
       }
@@ -2608,7 +2609,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
         app.error(
           `Pilot conversion failed: ${convError instanceof Error ? convError.message : String(convError)}`
         );
-        removeInstall(chartNumber);
+        rollbackInstall(chartNumber);
         setConvertingState(chartNumber, false);
         if (quarantineDir !== null) {
           cleanupQuarantineDir(quarantineDir);
@@ -2623,7 +2624,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
       }
       downloadManager.removeListener('job-completed', pilotListener);
       downloadManager.removeListener('job-failed', pilotFailListener);
-      removeInstall(chartNumber);
+      rollbackInstall(chartNumber);
       setConvertingState(chartNumber, false);
       setRncFailed(chartNumber, job.error ?? 'Download failed');
       cleanupDir(tmpDownloadDir);
@@ -2666,7 +2667,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
       const dlPath = dlFileName ? path.join(tmpDownloadDir, dlFileName) : null;
 
       if (!dlPath || !fs.existsSync(dlPath)) {
-        removeInstall(chartNumber);
+        rollbackInstall(chartNumber);
         cleanupDir(tmpDownloadDir);
         return;
       }
@@ -2706,7 +2707,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
         app.error(
           `ShpBasemap conversion failed: ${convError instanceof Error ? convError.message : String(convError)}`
         );
-        removeInstall(chartNumber);
+        rollbackInstall(chartNumber);
         setConvertingState(chartNumber, false);
         if (quarantineDir !== null) {
           cleanupQuarantineDir(quarantineDir);
@@ -2721,7 +2722,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
       }
       downloadManager.removeListener('job-completed', shpListener);
       downloadManager.removeListener('job-failed', shpFailListener);
-      removeInstall(chartNumber);
+      rollbackInstall(chartNumber);
       setConvertingState(chartNumber, false);
       cleanupDir(tmpDownloadDir);
     };
@@ -2780,7 +2781,7 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
         app.error(
           `GSHHG conversion failed: ${error instanceof Error ? error.message : String(error)}`
         );
-        removeInstall(chartNumber);
+        rollbackInstall(chartNumber);
         setConvertingState(chartNumber, false);
         if (quarantineDir !== null) {
           cleanupQuarantineDir(quarantineDir);

@@ -6,6 +6,7 @@ import type {
   CatalogCategory,
   CatalogChart,
   CatalogData,
+  CatalogInstall,
   CatalogInstallsMap,
   CatalogRegistryEntry,
   CatalogRegistryInfo,
@@ -54,6 +55,14 @@ let dataDir = '';
 let cacheDir = '';
 let installsFilePath = '';
 let installs: CatalogInstallsMap = {};
+// In-memory snapshot of the install record that trackInstall() is about to
+// overwrite, keyed by chartNumber. A failed conversion calls rollbackInstall()
+// to restore the prior record (a failed UPDATE — issue #120) or drop it (a
+// failed FRESH install, snapshot === null). Intentionally NOT persisted: it
+// only needs to live from the up-front trackInstall to that same attempt's
+// failure branch. A crash mid-conversion is handled by the orphan-reap path,
+// which removeInstall()s unconditionally.
+const installSnapshots = new Map<string, CatalogInstall | null>();
 const converting: Record<string, true> = {};
 let debug: DebugFunction = () => {};
 
@@ -460,6 +469,12 @@ export function trackInstall(
   zipfileDatetime: string,
   url: string
 ): void {
+  // Snapshot whatever is currently recorded BEFORE overwriting it, so a
+  // failed UPDATE can restore the still-on-disk old version (issue #120).
+  // A fresh install snapshots null, which rollbackInstall() treats as
+  // "delete the record" — same as the old removeInstall cleanup.
+  const prior = installs[chartNumber];
+  installSnapshots.set(chartNumber, prior ? { ...prior } : null);
   installs[chartNumber] = {
     catalogFile,
     zipfile_datetime_iso8601: zipfileDatetime,
@@ -469,9 +484,38 @@ export function trackInstall(
   saveInstalls();
 }
 
+/**
+ * Undo the most recent trackInstall() for a chart after its conversion or
+ * download FAILS (issue #120). Restores the record trackInstall snapshotted:
+ *   - prior record existed (an UPDATE)  → restore it, so checkForUpdates
+ *     keeps flagging the update (the old version is still on disk).
+ *   - prior record was null (a FRESH install) → delete it, so there's no
+ *     stale record for a chart that isn't installed.
+ *   - no snapshot at all (defensive)    → fall back to removeInstall so an
+ *     in-flight record is still cleaned up.
+ * Always clears the snapshot afterwards.
+ */
+export function rollbackInstall(chartNumber: string): void {
+  if (!installSnapshots.has(chartNumber)) {
+    removeInstall(chartNumber);
+    return;
+  }
+  const prior = installSnapshots.get(chartNumber) ?? null;
+  installSnapshots.delete(chartNumber);
+  if (prior) {
+    installs[chartNumber] = prior;
+  } else {
+    delete installs[chartNumber];
+  }
+  saveInstalls();
+}
+
 export function removeInstall(chartNumber: string): void {
   if (installs[chartNumber]) {
     delete installs[chartNumber];
+    // A genuine removal supersedes any pending rollback snapshot for this
+    // exact key, so a later rollbackInstall can't resurrect the record.
+    installSnapshots.delete(chartNumber);
     saveInstalls();
     return;
   }
@@ -507,6 +551,9 @@ export function setInstallFilename(chartNumber: string, filename: string): void 
     return;
   }
   install.installedFilename = filename;
+  // Conversion succeeded — the new record stands. Drop the prior-version
+  // snapshot so a later rollbackInstall can't resurrect the old record.
+  installSnapshots.delete(chartNumber);
   saveInstalls();
 }
 
@@ -589,14 +636,17 @@ export function checkForUpdates(): CatalogUpdate[] {
         // Windows) and take the directory portion with posix semantics.
         const normalized = install.installedFilename.replace(/\\/g, '/');
         const folder = path.posix.dirname(normalized);
-        // dirname returns '.' for a file in the root folder. Treat that,
-        // any traversal ('../foo'), and any absolute path (a malformed
-        // record) as root — installedFolder must stay chart-path-relative.
+        // dirname returns '.' for a file in the root folder. Treat that, any
+        // traversal segment ('../foo', 'a/../b'), a Windows drive prefix
+        // ('C:/…' after the backslash normalize), and any absolute path (all
+        // malformed records) as root — installedFolder must stay
+        // chart-path-relative.
         if (
           folder &&
           folder !== '.' &&
           folder !== '/' &&
-          !folder.startsWith('../') &&
+          !folder.split('/').includes('..') &&
+          !/^[a-zA-Z]:/.test(folder) &&
           !path.posix.isAbsolute(folder)
         ) {
           installedFolder = folder;
