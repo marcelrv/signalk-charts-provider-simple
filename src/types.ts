@@ -181,8 +181,13 @@ export interface DownloadJob {
 // it stays a plain interface.
 
 export type {
-    CatalogCategory, CatalogChart, CatalogData, CatalogHeader, CatalogInstall,
-    CatalogInstallsMap, CatalogRegistryEntry
+  CatalogCategory,
+  CatalogChart,
+  CatalogData,
+  CatalogHeader,
+  CatalogInstall,
+  CatalogInstallsMap,
+  CatalogRegistryEntry
 } from './utils/catalog-schemas.js';
 
 import type { CatalogRegistryEntry } from './utils/catalog-schemas.js';
@@ -322,4 +327,3 @@ export interface TilemapXml {
 // ---- Express route helpers ----
 
 export type { IRouter, Request, Response };
-
