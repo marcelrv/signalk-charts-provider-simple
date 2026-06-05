@@ -165,4 +165,53 @@ test.describe('Chart Catalog tab', () => {
     await row.locator('[data-catalog-dismiss="1"]').click();
     await expect(row.locator('.conversion-error-text')).toHaveCount(0);
   });
+
+  test('a completed update drops out of the panel without re-opening the tab (issue #121)', async ({
+    page
+  }) => {
+    // Regression for #121: after a conversion finishes, the in-memory
+    // catalogUpdates was never re-fetched, so the row kept showing
+    // "update available" until the user left and re-entered the tab.
+    // pollConversions must call refreshUpdateBadge() on a just-finished
+    // conversion so the row clears live.
+    await page.goto('/plugins/signalk-charts-provider-simple/');
+    await setMockState(page, {
+      registry: [
+        {
+          file: 'NL_IENC.xml',
+          label: 'NL IENC',
+          category: 'ienc',
+          chartCount: 1,
+          cachedAt: '2026-05-07T10:00:00Z'
+        }
+      ],
+      catalogUpdates: [
+        {
+          chartNumber: '1',
+          catalogFile: 'NL_IENC.xml',
+          title: 'Waddenzee',
+          installedDate: '2024-01-01T00:00:00Z',
+          availableDate: '2026-05-01T00:00:00Z',
+          downloadUrl: 'https://example.com/wadd.zip',
+          installedFolder: '/'
+        }
+      ],
+      // The chart is mid-conversion: the panel shows it as updating.
+      converting: { '1': true }
+    });
+
+    await page.getByRole('button', { name: /Chart Catalog/i }).click();
+
+    const row = page.locator('.catalog-update-row[data-chart-number="1"]');
+    await expect(row).toBeVisible();
+    await expect(row).toHaveClass(/updating/);
+
+    // The conversion finishes: no longer converting, and the backend no
+    // longer reports it as an available update (its install date caught up).
+    await patchMockState(page, { converting: {}, catalogUpdates: [] });
+
+    // pollConversions (every 3s) must detect the just-finished conversion
+    // and refresh the updates list, removing the row live — no tab reload.
+    await expect(row).toHaveCount(0, { timeout: 10_000 });
+  });
 });

@@ -1187,7 +1187,11 @@ async function pollCatalogDownloads(): Promise<void> {
           }
         }
         renderCatalogList();
-        renderUpdatesSection();
+        // Re-fetch the updates list so the just-updated chart drops out of
+        // the panel/badge; the in-memory catalogUpdates is otherwise stale
+        // and the row keeps showing "update available" until the tab is
+        // re-opened. refreshUpdateBadge() re-renders the section itself.
+        void refreshUpdateBadge();
       } else if (job.status === 'failed') {
         delete catalogDownloadJobs[chartNumber];
         if (progressEl) {
@@ -1344,6 +1348,11 @@ async function pollConversions(): Promise<void> {
             }
           })
         );
+        // A finished conversion means the chart is now up to date — re-fetch
+        // the updates list so it drops out of the panel/badge. Without this
+        // the in-memory catalogUpdates stays stale and the row keeps showing
+        // "update available" until the tab is re-opened.
+        await refreshUpdateBadge();
       }
     }
 
