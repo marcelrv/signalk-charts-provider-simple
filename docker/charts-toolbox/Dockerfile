@@ -92,6 +92,11 @@ COPY --from=tippecanoe-builder /usr/local/bin/tippecanoe-enumerate /usr/local/bi
 COPY --from=tippecanoe-builder /usr/local/bin/tippecanoe-overzoom /usr/local/bin/
 COPY --from=tippecanoe-builder /usr/local/bin/tippecanoe-json-tool /usr/local/bin/
 
+# xz-utils for extracting .tar.xz archives (GSHHG, Shapefiles, Pilot tarballs).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 # Run as a fixed non-root user.  Defense-in-depth: even though every
 # `runJob` invocation is a short-lived helper with no network and no
 # privileged capabilities, root-by-default in helper containers is a
