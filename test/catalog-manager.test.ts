@@ -19,7 +19,8 @@ import {
   getInstalledCatalogCharts,
   checkForUpdates,
   getCatalogsWithInstalledCharts,
-  getCachedCatalog
+  getCachedCatalog,
+  pruneStaleInstalls
 } from '../dist/utils/catalog-manager.js';
 import type { CatalogInstall } from '../dist/types.js';
 
@@ -492,23 +493,23 @@ describe('CatalogManager', () => {
       removeInstall('p');
     });
 
-    it('survives a restart mid-update: snapshot reloads and rolls back to prior', () => {
+    it('survives a restart mid-update: load auto-rolls-back to prior (no reap needed)', () => {
       seedCache('rst', '2024-06-10T00:00:00Z');
       trackInstall('rst', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/old.mbtiles');
       setInstallFilename('rst', 'rst.mbtiles'); // committed old
       trackInstall('rst', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/new.mbtiles'); // begin update, NOT committed
 
       // Simulate a Signal K restart: drop module memory, reload from disk.
+      // Recovery is automatic in loadInstalls() — NO manual rollbackInstall,
+      // because orphan-reap does not fire for a download-phase restart.
       initCatalogManager(TEST_DATA_DIR, () => {});
-      // The orphan-reap recovery path (what index.ts now calls):
-      rollbackInstall('rst');
 
       const rec = getInstalledCatalogCharts()['rst'];
       assert.ok(rec, 'prior version must survive the restart');
       assert.strictEqual(rec.zipfile_datetime_iso8601, '2024-01-01T00:00:00Z');
       assert.strictEqual(rec.zipfile_location, 'https://example.com/old.mbtiles');
       assert.strictEqual(rec.installedFilename, 'rst.mbtiles');
-      assert.ok(!('previousVersion' in rec), 'rollback must clear the snapshot marker');
+      assert.ok(!('previousVersion' in rec), 'recovery must clear the snapshot marker');
 
       const u = checkForUpdates().find((x) => x.chartNumber === 'rst');
       assert.ok(u, 'the still-pending update must keep surfacing after a restart');
@@ -517,10 +518,32 @@ describe('CatalogManager', () => {
       removeInstall('rst');
     });
 
-    it('survives a restart mid-fresh-install: pending record is dropped on reap', () => {
+    it('survives a restart mid-update even when pruneStaleInstalls runs', () => {
+      // Reproduces the live finding: prune runs at startup before any reap and
+      // must NOT delete an in-flight record (the new file isn't on disk yet, so
+      // its chartId is absent from the scanned set). With load-time recovery the
+      // record is already rolled back to the prior version by the time prune
+      // runs; prune must leave that prior record intact.
+      seedCache('prn', '2024-06-10T00:00:00Z');
+      trackInstall('prn', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/old.mbtiles');
+      setInstallFilename('prn', 'old-prn.mbtiles'); // committed old → chartId 'old-prn'
+      trackInstall('prn', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/new.mbtiles'); // begin update
+
+      initCatalogManager(TEST_DATA_DIR, () => {}); // restart → load auto-rolls-back to old-prn
+      // Startup then scans charts and prunes. The old file IS on disk, so its
+      // chartId is present; pass it so prune keeps the recovered record.
+      pruneStaleInstalls(['old-prn']);
+
+      const rec = getInstalledCatalogCharts()['prn'];
+      assert.ok(rec, 'recovered prior record must survive prune');
+      assert.strictEqual(rec.zipfile_datetime_iso8601, '2024-01-01T00:00:00Z');
+      assert.strictEqual(rec.installedFilename, 'old-prn.mbtiles');
+      removeInstall('prn');
+    });
+
+    it('survives a restart mid-fresh-install: pending record dropped on load', () => {
       trackInstall('frsh', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/a.mbtiles');
-      initCatalogManager(TEST_DATA_DIR, () => {}); // restart
-      rollbackInstall('frsh'); // orphan-reap recovery
+      initCatalogManager(TEST_DATA_DIR, () => {}); // restart → load drops the never-committed fresh record
       assert.strictEqual(getInstalledCatalogCharts()['frsh'], undefined);
     });
 
