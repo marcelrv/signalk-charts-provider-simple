@@ -21,6 +21,7 @@ import {
   getCatalogsWithInstalledCharts,
   getCachedCatalog
 } from '../dist/utils/catalog-manager.js';
+import type { CatalogInstall } from '../dist/types.js';
 
 // ESM equivalent of CJS `__dirname`.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -424,10 +425,16 @@ describe('CatalogManager', () => {
       trackInstall('s', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/v1.mbtiles');
       setInstallFilename('s', 'v1.mbtiles');
       trackInstall('s', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/v2.mbtiles');
-      setInstallFilename('s', 'v2.mbtiles'); // success clears the snapshot
-      // A stray rollback now must NOT restore v1 (snapshot is gone → removeInstall).
+      setInstallFilename('s', 'v2.mbtiles'); // success commits, clears the marker
+      // A stray rollback on a committed record is a no-op — it must neither
+      // restore v1 nor delete the settled install.
       rollbackInstall('s');
-      assert.strictEqual(getInstalledCatalogCharts()['s'], undefined);
+      const rec = getInstalledCatalogCharts()['s'];
+      assert.ok(rec, 'a committed record must survive a stray rollback');
+      assert.strictEqual(rec.zipfile_datetime_iso8601, '2024-06-10T00:00:00Z');
+      assert.strictEqual(rec.installedFilename, 'v2.mbtiles');
+      assert.ok(!('previousVersion' in rec), 'commit must clear the snapshot marker');
+      removeInstall('s');
     });
 
     it('restores the original across sequential failed updates', () => {
@@ -443,7 +450,7 @@ describe('CatalogManager', () => {
       removeInstall('seq');
     });
 
-    it('falls back to removeInstall when there is no snapshot', () => {
+    it('is a no-op for a chart that was never tracked', () => {
       assert.doesNotThrow(() => {
         rollbackInstall('never-tracked');
       });
@@ -459,14 +466,70 @@ describe('CatalogManager', () => {
       removeInstall('2');
     });
 
-    it('removeInstall clears a pending snapshot so a later rollback cannot resurrect it', () => {
+    it('removeInstall drops the whole record (incl. snapshot) so a later rollback cannot resurrect it', () => {
       trackInstall('d', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/old.mbtiles');
       setInstallFilename('d', 'd.mbtiles');
-      trackInstall('d', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/new.mbtiles'); // snapshot = old
-      removeInstall('d'); // genuine removal must drop the snapshot
-      trackInstall('d', CATALOG, '2024-09-01T00:00:00Z', 'https://example.com/newer.mbtiles');
-      rollbackInstall('d'); // snapshot here is null (fresh after removeInstall) → deletes
+      trackInstall('d', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/new.mbtiles'); // previousVersion = old
+      removeInstall('d'); // deletes the whole record, snapshot and all
+      trackInstall('d', CATALOG, '2024-09-01T00:00:00Z', 'https://example.com/newer.mbtiles'); // fresh → previousVersion null
+      rollbackInstall('d'); // fresh pending → deletes
       assert.strictEqual(getInstalledCatalogCharts()['d'], undefined);
+    });
+
+    it('persists the prior version inside the on-disk record (restart-safe)', () => {
+      trackInstall('p', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/v1.mbtiles');
+      setInstallFilename('p', 'v1.mbtiles'); // committed v1
+      trackInstall('p', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/v2.mbtiles'); // begin update
+      const raw = JSON.parse(
+        fs.readFileSync(path.join(TEST_DATA_DIR, 'catalog-installs.json'), 'utf-8')
+      ) as Record<string, CatalogInstall>;
+      assert.strictEqual(raw['p']!.zipfile_datetime_iso8601, '2024-06-10T00:00:00Z');
+      const snap = raw['p']!.previousVersion;
+      assert.ok(snap, 'snapshot must be persisted on disk');
+      assert.strictEqual(snap.zipfile_datetime_iso8601, '2024-01-01T00:00:00Z');
+      assert.strictEqual(snap.installedFilename, 'v1.mbtiles');
+      assert.ok(!('previousVersion' in snap), 'snapshot must not nest');
+      removeInstall('p');
+    });
+
+    it('survives a restart mid-update: snapshot reloads and rolls back to prior', () => {
+      seedCache('rst', '2024-06-10T00:00:00Z');
+      trackInstall('rst', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/old.mbtiles');
+      setInstallFilename('rst', 'rst.mbtiles'); // committed old
+      trackInstall('rst', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/new.mbtiles'); // begin update, NOT committed
+
+      // Simulate a Signal K restart: drop module memory, reload from disk.
+      initCatalogManager(TEST_DATA_DIR, () => {});
+      // The orphan-reap recovery path (what index.ts now calls):
+      rollbackInstall('rst');
+
+      const rec = getInstalledCatalogCharts()['rst'];
+      assert.ok(rec, 'prior version must survive the restart');
+      assert.strictEqual(rec.zipfile_datetime_iso8601, '2024-01-01T00:00:00Z');
+      assert.strictEqual(rec.zipfile_location, 'https://example.com/old.mbtiles');
+      assert.strictEqual(rec.installedFilename, 'rst.mbtiles');
+      assert.ok(!('previousVersion' in rec), 'rollback must clear the snapshot marker');
+
+      const u = checkForUpdates().find((x) => x.chartNumber === 'rst');
+      assert.ok(u, 'the still-pending update must keep surfacing after a restart');
+      assert.strictEqual(u.installedDate, '2024-01-01T00:00:00Z');
+      assert.strictEqual(u.availableDate, '2024-06-10T00:00:00Z');
+      removeInstall('rst');
+    });
+
+    it('survives a restart mid-fresh-install: pending record is dropped on reap', () => {
+      trackInstall('frsh', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/a.mbtiles');
+      initCatalogManager(TEST_DATA_DIR, () => {}); // restart
+      rollbackInstall('frsh'); // orphan-reap recovery
+      assert.strictEqual(getInstalledCatalogCharts()['frsh'], undefined);
+    });
+
+    it('does not delete a committed record that has no snapshot marker', () => {
+      trackInstall('cm', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/v1.mbtiles');
+      setInstallFilename('cm', 'v1.mbtiles'); // committed, marker cleared
+      rollbackInstall('cm'); // spurious reap
+      assert.ok(getInstalledCatalogCharts()['cm'], 'committed record must not be deleted');
+      removeInstall('cm');
     });
   });
 
