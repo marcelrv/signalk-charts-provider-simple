@@ -406,7 +406,14 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
             );
             if (chartNumber) {
               setConvertingState(chartNumber, false);
-              removeInstall(chartNumber);
+              // A restart/crash can land here mid-update. rollbackInstall
+              // restores the prior on-disk version (UPDATE) or drops the
+              // pending record (FRESH), reading the snapshot trackInstall
+              // persisted in the record — so a still-pending update keeps
+              // surfacing in checkForUpdates(). For a committed record (no
+              // snapshot marker) it's a no-op, so a spurious reap of an
+              // already-installed chart doesn't delete it.
+              rollbackInstall(chartNumber);
             }
           }
           if (cleanup.reaped.length > 0) {

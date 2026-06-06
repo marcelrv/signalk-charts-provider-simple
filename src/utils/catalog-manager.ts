@@ -55,14 +55,6 @@ let dataDir = '';
 let cacheDir = '';
 let installsFilePath = '';
 let installs: CatalogInstallsMap = {};
-// In-memory snapshot of the install record that trackInstall() is about to
-// overwrite, keyed by chartNumber. A failed conversion calls rollbackInstall()
-// to restore the prior record (a failed UPDATE — issue #120) or drop it (a
-// failed FRESH install, snapshot === null). Intentionally NOT persisted: it
-// only needs to live from the up-front trackInstall to that same attempt's
-// failure branch. A crash mid-conversion is handled by the orphan-reap path,
-// which removeInstall()s unconditionally.
-const installSnapshots = new Map<string, CatalogInstall | null>();
 const converting: Record<string, true> = {};
 let debug: DebugFunction = () => {};
 
@@ -469,39 +461,52 @@ export function trackInstall(
   zipfileDatetime: string,
   url: string
 ): void {
-  // Snapshot whatever is currently recorded BEFORE overwriting it, so a
-  // failed UPDATE can restore the still-on-disk old version (issue #120).
-  // A fresh install snapshots null, which rollbackInstall() treats as
-  // "delete the record" — same as the old removeInstall cleanup.
+  // Snapshot the prior record INSIDE the new record (persisted to disk via
+  // saveInstalls) so a restart mid-update can still roll back to the
+  // still-on-disk old version (issue #120 restart window). An in-memory-only
+  // snapshot would be lost on a plugin hot-restart (every config save) or a
+  // Signal K restart. The presence of `previousVersion` marks the install as
+  // in-flight; a FRESH install records `null` ("delete on rollback").
+  // Strip any nested previousVersion so snapshots never stack across
+  // sequential failed updates — the snapshot always points at the last
+  // committed version.
+  let snapshot: CatalogInstall | null = null;
   const prior = installs[chartNumber];
-  installSnapshots.set(chartNumber, prior ? { ...prior } : null);
+  if (prior) {
+    // Omit the prior's own previousVersion key entirely (not set it to
+    // undefined) so the snapshot is exactly one level deep and never carries a
+    // dangling key.
+    const { previousVersion: _nested, ...flat } = prior;
+    snapshot = flat;
+  }
   installs[chartNumber] = {
     catalogFile,
     zipfile_datetime_iso8601: zipfileDatetime,
     installedAt: new Date().toISOString(),
-    zipfile_location: url
+    zipfile_location: url,
+    previousVersion: snapshot
   };
   saveInstalls();
 }
 
 /**
- * Undo the most recent trackInstall() for a chart after its conversion or
- * download FAILS (issue #120). Restores the record trackInstall snapshotted:
- *   - prior record existed (an UPDATE)  → restore it, so checkForUpdates
+ * Undo an in-flight trackInstall() after its conversion/download FAILS, or
+ * when the orphan-reap path recovers a job interrupted by a restart (issue
+ * #120). Reads the snapshot persisted in the record by trackInstall():
+ *   - previousVersion is an object (an UPDATE) → restore it, so checkForUpdates
  *     keeps flagging the update (the old version is still on disk).
- *   - prior record was null (a FRESH install) → delete it, so there's no
- *     stale record for a chart that isn't installed.
- *   - no snapshot at all (defensive)    → fall back to removeInstall so an
- *     in-flight record is still cleaned up.
- * Always clears the snapshot afterwards.
+ *   - previousVersion is null (a FRESH install) → delete the pending record.
+ *   - no `previousVersion` key (a COMMITTED record, or one from an older
+ *     plugin build) → no-op: never delete a settled install. This matters
+ *     because the orphan-reap site calls rollbackInstall for every reaped
+ *     chart, including spurious reaps of already-committed installs.
  */
 export function rollbackInstall(chartNumber: string): void {
-  if (!installSnapshots.has(chartNumber)) {
-    removeInstall(chartNumber);
+  const current = installs[chartNumber];
+  if (!current || !('previousVersion' in current)) {
     return;
   }
-  const prior = installSnapshots.get(chartNumber) ?? null;
-  installSnapshots.delete(chartNumber);
+  const prior = current.previousVersion ?? null;
   if (prior) {
     installs[chartNumber] = prior;
   } else {
@@ -513,9 +518,6 @@ export function rollbackInstall(chartNumber: string): void {
 export function removeInstall(chartNumber: string): void {
   if (installs[chartNumber]) {
     delete installs[chartNumber];
-    // A genuine removal supersedes any pending rollback snapshot for this
-    // exact key, so a later rollbackInstall can't resurrect the record.
-    installSnapshots.delete(chartNumber);
     saveInstalls();
     return;
   }
@@ -551,9 +553,11 @@ export function setInstallFilename(chartNumber: string, filename: string): void 
     return;
   }
   install.installedFilename = filename;
-  // Conversion succeeded — the new record stands. Drop the prior-version
-  // snapshot so a later rollbackInstall can't resurrect the old record.
-  installSnapshots.delete(chartNumber);
+  // Conversion succeeded — commit. Drop the previousVersion marker so the
+  // record is "settled": a later stray rollbackInstall (or an orphan-reap
+  // recovery after a restart) can't resurrect the old version or re-treat it
+  // as in-flight.
+  delete install.previousVersion;
   saveInstalls();
 }
 

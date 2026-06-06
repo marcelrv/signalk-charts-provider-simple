@@ -57,17 +57,26 @@ export const CatalogDataSchema = Type.Object({
   charts: Type.Array(CatalogChartSchema)
 });
 
-export const CatalogInstallSchema = Type.Object({
-  catalogFile: Type.String(),
-  zipfile_datetime_iso8601: Type.String(),
-  installedAt: Type.String(),
-  zipfile_location: Type.String(),
-  // Relative path of the produced .mbtiles under chartPath. Optional
-  // because the install is recorded before the conversion finishes;
-  // the converter calls setInstallFilename() once the file is on disk
-  // so the delete flow can find this record by filename.
-  installedFilename: Type.Optional(Type.String())
-});
+export const CatalogInstallSchema = Type.Recursive((Self) =>
+  Type.Object({
+    catalogFile: Type.String(),
+    zipfile_datetime_iso8601: Type.String(),
+    installedAt: Type.String(),
+    zipfile_location: Type.String(),
+    // Relative path of the produced .mbtiles under chartPath. Optional
+    // because the install is recorded before the conversion finishes;
+    // the converter calls setInstallFilename() once the file is on disk
+    // so the delete flow can find this record by filename.
+    installedFilename: Type.Optional(Type.String()),
+    // Snapshot of the prior record, captured up-front by trackInstall() so a
+    // restart mid-update can roll back to the still-on-disk old version
+    // (issue #120 restart window). `null` marks a pending FRESH install
+    // ("delete on rollback"). Cleared by setInstallFilename() on success, so
+    // its presence means "this install is in-flight". One level deep only —
+    // trackInstall strips any nested snapshot.
+    previousVersion: Type.Optional(Type.Union([Self, Type.Null()]))
+  })
+);
 
 export const CatalogInstallsMapSchema = Type.Record(Type.String(), CatalogInstallSchema);
 
