@@ -148,6 +148,7 @@ function loadInstalls(): void {
       const parsed = safeParse(CatalogInstallsMapSchema, raw);
       if (parsed) {
         installs = parsed;
+        recoverInFlightUpdates();
       } else {
         console.error('Discarding catalog installs file — shape did not match schema');
         installs = {};
@@ -156,6 +157,35 @@ function loadInstalls(): void {
   } catch (error) {
     console.error('Error loading catalog installs:', error);
     installs = {};
+  }
+}
+
+/**
+ * On load, any record still carrying a `previousVersion` marker is an update
+ * that was interrupted before it committed (a clean success clears the marker
+ * via setInstallFilename). Since we are loading fresh from disk in a new
+ * process, that conversion is by definition not running here — so roll each one
+ * back to its prior version (issue #120 restart window). This makes recovery
+ * independent of the orphan-reap path, which only fires for leaked containers
+ * and never runs when the restart happened during the download phase.
+ */
+function recoverInFlightUpdates(): void {
+  let changed = false;
+  for (const [chartNumber, install] of Object.entries(installs)) {
+    if (!('previousVersion' in install)) {
+      continue;
+    }
+    const prior = install.previousVersion ?? null;
+    if (prior) {
+      installs[chartNumber] = prior; // restore the old version (UPDATE)
+    } else {
+      delete installs[chartNumber]; // drop the pending record (FRESH install)
+    }
+    changed = true;
+    console.log(`[charts-provider] Recovered interrupted update for ${chartNumber} on load`);
+  }
+  if (changed) {
+    saveInstalls();
   }
 }
 
@@ -684,6 +714,13 @@ export function pruneStaleInstalls(chartIdentifiers: string[]): void {
   let pruned = false;
 
   for (const [key, install] of Object.entries(installs)) {
+    // An in-flight update (carries the previousVersion marker) is not stale —
+    // its new file isn't on disk yet, but the old one still is. recoverInFlight-
+    // Updates() rolls these back at load, so prune normally never sees one;
+    // this guard keeps prune from destroying the snapshot if ordering changes.
+    if ('previousVersion' in install) {
+      continue;
+    }
     // Authoritative path: if we recorded the on-disk filename at
     // conversion/move/rename time, the install key should match the
     // chart whose chartId is the basename-without-extension. Anything
