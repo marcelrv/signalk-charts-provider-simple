@@ -197,6 +197,23 @@ export interface CatalogRegistryInfo extends CatalogRegistryEntry {
   cachedAt: string | null;
 }
 
+// Result of the last attempt to fetch the catalog index from GitHub. Drives
+// UI messaging when the registry is empty or a refresh fails — notably so a
+// GitHub rate-limit (HTTP 403, remaining 0) reads as "rate limited, retry at
+// X" instead of the wrong "you may be offline".
+export type RegistryFetchStatus = 'ok' | 'rate_limited' | 'error' | 'never';
+
+export interface RegistryStatus {
+  status: RegistryFetchStatus;
+  isRateLimited: boolean;
+  remaining: number | null; // x-ratelimit-remaining
+  resetAt: number | null; // x-ratelimit-reset, epoch ms
+  retryAfter: number | null; // retry-after header, seconds
+  lastAttemptAt: number | null;
+  lastSuccessAt: number | null;
+  httpStatus: number | null; // null for network/timeout errors
+}
+
 export type UrlFormat =
   | 'mbtiles'
   | 'zip'

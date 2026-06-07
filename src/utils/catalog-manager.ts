@@ -12,6 +12,7 @@ import type {
   CatalogRegistryInfo,
   CatalogUpdate,
   DebugFunction,
+  RegistryStatus,
   UrlClassification
 } from '../types.js';
 import {
@@ -48,6 +49,33 @@ const COUNTRY_CODES: Record<string, string> = {
 };
 
 let catalogRegistry: CatalogRegistryEntry[] = [];
+
+// Result of the last GitHub registry-fetch attempt — surfaced to the UI so an
+// empty/failed fetch can show an accurate reason (rate-limited vs offline vs
+// generic error) instead of a misleading "you may be offline".
+const registryStatus: RegistryStatus = {
+  status: 'never',
+  isRateLimited: false,
+  remaining: null,
+  resetAt: null,
+  retryAfter: null,
+  lastAttemptAt: null,
+  lastSuccessAt: null,
+  httpStatus: null
+};
+
+// Single-flight guard: the up-front fetch at init plus a Refresh-button click
+// (or two clicks) must not issue concurrent GitHub requests. A call while one
+// is in flight returns the in-progress promise.
+let inFlightRegistryFetch: Promise<CatalogRegistryEntry[]> | null = null;
+
+function parseHeaderInt(v: string | string[] | undefined): number | null {
+  if (v === undefined) {
+    return null;
+  }
+  const n = parseInt(Array.isArray(v) ? (v[0] ?? '') : v, 10);
+  return Number.isFinite(n) ? n : null;
+}
 
 const CACHE_MAX_AGE_MS = 60 * 60 * 1000;
 
@@ -306,13 +334,46 @@ export function initCatalogManager(dataDirPath: string, debugFn: DebugFunction):
 }
 
 export function fetchCatalogRegistry(): Promise<CatalogRegistryEntry[]> {
+  if (inFlightRegistryFetch) {
+    return inFlightRegistryFetch;
+  }
+  inFlightRegistryFetch = doFetchCatalogRegistry().finally(() => {
+    inFlightRegistryFetch = null;
+  });
+  return inFlightRegistryFetch;
+}
+
+function doFetchCatalogRegistry(): Promise<CatalogRegistryEntry[]> {
   return new Promise((resolve, reject) => {
+    registryStatus.lastAttemptAt = Date.now();
     const req = https
       .get(
         CATALOG_GITHUB_API,
         { headers: { 'User-Agent': 'signalk-charts-provider-simple' } },
         (response) => {
+          // Read rate-limit headers on EVERY response (success and failure),
+          // so `remaining` is current even on a 200.
+          const remaining = parseHeaderInt(response.headers['x-ratelimit-remaining']);
+          const resetSec = parseHeaderInt(response.headers['x-ratelimit-reset']);
+          const retryAfter = parseHeaderInt(response.headers['retry-after']);
+          if (remaining !== null) {
+            registryStatus.remaining = remaining;
+          }
+          if (resetSec !== null) {
+            registryStatus.resetAt = resetSec * 1000;
+          }
+          registryStatus.retryAfter = retryAfter;
+          registryStatus.httpStatus = response.statusCode ?? null;
+
           if (response.statusCode !== 200) {
+            // Classify off THIS response's header (the local `remaining`), not
+            // the persisted field — a 403/429 without an x-ratelimit-remaining
+            // header must not inherit a previous response's 0 and get
+            // mislabeled rate-limited.
+            const rateLimited =
+              (response.statusCode === 403 || response.statusCode === 429) && remaining === 0;
+            registryStatus.isRateLimited = rateLimited;
+            registryStatus.status = rateLimited ? 'rate_limited' : 'error';
             response.resume();
             reject(new Error(`GitHub API returned ${response.statusCode}`));
             return;
@@ -328,6 +389,10 @@ export function fetchCatalogRegistry(): Promise<CatalogRegistryEntry[]> {
               const raw: unknown = JSON.parse(data);
               const files = safeParse(GithubContentsListingSchema, raw);
               if (!files) {
+                // Reached GitHub (200) but the body was malformed — a generic
+                // error, definitively not a rate limit.
+                registryStatus.isRateLimited = false;
+                registryStatus.status = 'error';
                 reject(new Error('GitHub API response did not match expected shape'));
                 return;
               }
@@ -344,18 +409,40 @@ export function fetchCatalogRegistry(): Promise<CatalogRegistryEntry[]> {
                 saveRegistryCache();
                 debug(`Catalog registry: ${xmlFiles.length} catalogs from GitHub`);
               }
+              // A successful fetch means we are not rate-limited; clear the
+              // rate-limit metadata so a stale reset/retry time can't leak into
+              // the UI later (resetAt/retryAfter are only meaningful while
+              // isRateLimited).
+              registryStatus.isRateLimited = false;
+              registryStatus.status = 'ok';
+              registryStatus.resetAt = null;
+              registryStatus.retryAfter = null;
+              registryStatus.lastSuccessAt = Date.now();
               resolve(xmlFiles);
             } catch (err) {
+              registryStatus.isRateLimited = false;
+              registryStatus.status = 'error';
               reject(err);
             }
           });
         }
       )
-      .on('error', reject);
+      .on('error', (err) => {
+        // Network/DNS failure or timeout — genuinely offline-ish, NOT a rate
+        // limit. httpStatus stays null so the UI shows the connectivity copy.
+        registryStatus.status = 'error';
+        registryStatus.isRateLimited = false;
+        registryStatus.httpStatus = null;
+        reject(err);
+      });
     req.setTimeout(15000, () => {
       req.destroy(new Error('GitHub API request timed out after 15s'));
     });
   });
+}
+
+export function getRegistryStatus(): RegistryStatus {
+  return { ...registryStatus };
 }
 
 export function getCatalogRegistry(): CatalogRegistryInfo[] {

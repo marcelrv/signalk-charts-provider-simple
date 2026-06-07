@@ -2,9 +2,13 @@
  * Tests for the catalog manager module
  */
 
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, afterEach, mock } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
+// NOTE: the module under test imports from 'https' (not 'node:https'); ESM
+// treats those as separate module instances, so we must mock the SAME
+// specifier for the stub to intercept the dist module's https.get.
+import https from 'https';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,7 +24,9 @@ import {
   checkForUpdates,
   getCatalogsWithInstalledCharts,
   getCachedCatalog,
-  pruneStaleInstalls
+  pruneStaleInstalls,
+  fetchCatalogRegistry,
+  getRegistryStatus
 } from '../dist/utils/catalog-manager.js';
 import type { CatalogInstall } from '../dist/types.js';
 
@@ -33,13 +39,66 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // gets cleaned in the test's after hook so no commit-time leakage.
 const TEST_DATA_DIR = path.join(__dirname, 'fixtures', 'catalog-test-data');
 
+// Minimal https.get stub that resolves an empty 200 registry, so any fetch it
+// covers never touches the network. Shared by the outer init and the
+// rate-limit suite's drain so neither makes a live GitHub call.
+function stubHttpsEmpty200(): void {
+  mock.method(https, 'get', (...args: unknown[]) => {
+    const cb = args[args.length - 1] as (r: unknown) => void;
+    const req = {
+      on() {
+        return req;
+      },
+      setTimeout() {
+        return req;
+      },
+      destroy() {
+        /* no-op */
+      }
+    };
+    process.nextTick(() => {
+      const response = {
+        statusCode: 200,
+        headers: { 'x-ratelimit-remaining': '60' },
+        resume() {
+          /* drained */
+        },
+        on(event: string, handler: (chunk?: Buffer) => void) {
+          if (event === 'data') {
+            handler(Buffer.from('[]'));
+          }
+          if (event === 'end') {
+            handler();
+          }
+          return response;
+        }
+      };
+      cb(response);
+    });
+    return req;
+  });
+}
+
+// Every initCatalogManager() fire-and-forgets fetchCatalogRegistry(), so any
+// call (suite setup AND each restart simulation) must run under a stub or it
+// makes a live GitHub call and leaks an in-flight request into later
+// assertions. This wraps init: stub https.get, init (its synchronous
+// loadInstalls/recovery runs here, before the await), drain the pending
+// fetch, restore.
+async function initCatalogManagerOffline(): Promise<void> {
+  stubHttpsEmpty200();
+  initCatalogManager(TEST_DATA_DIR, () => {});
+  await fetchCatalogRegistry().catch(() => undefined);
+  mock.restoreAll();
+}
+
 describe('CatalogManager', () => {
-  before(() => {
+  before(async () => {
     // Clean up any previous test data
     if (fs.existsSync(TEST_DATA_DIR)) {
       fs.rmSync(TEST_DATA_DIR, { recursive: true });
     }
-    initCatalogManager(TEST_DATA_DIR, () => {});
+    await initCatalogManagerOffline();
   });
 
   after(() => {
@@ -493,7 +552,7 @@ describe('CatalogManager', () => {
       removeInstall('p');
     });
 
-    it('survives a restart mid-update: load auto-rolls-back to prior (no reap needed)', () => {
+    it('survives a restart mid-update: load auto-rolls-back to prior (no reap needed)', async () => {
       seedCache('rst', '2024-06-10T00:00:00Z');
       trackInstall('rst', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/old.mbtiles');
       setInstallFilename('rst', 'rst.mbtiles'); // committed old
@@ -502,7 +561,7 @@ describe('CatalogManager', () => {
       // Simulate a Signal K restart: drop module memory, reload from disk.
       // Recovery is automatic in loadInstalls() — NO manual rollbackInstall,
       // because orphan-reap does not fire for a download-phase restart.
-      initCatalogManager(TEST_DATA_DIR, () => {});
+      await initCatalogManagerOffline();
 
       const rec = getInstalledCatalogCharts()['rst'];
       assert.ok(rec, 'prior version must survive the restart');
@@ -518,7 +577,7 @@ describe('CatalogManager', () => {
       removeInstall('rst');
     });
 
-    it('survives a restart mid-update even when pruneStaleInstalls runs', () => {
+    it('survives a restart mid-update even when pruneStaleInstalls runs', async () => {
       // Reproduces the live finding: prune runs at startup before any reap and
       // must NOT delete an in-flight record (the new file isn't on disk yet, so
       // its chartId is absent from the scanned set). With load-time recovery the
@@ -529,7 +588,7 @@ describe('CatalogManager', () => {
       setInstallFilename('prn', 'old-prn.mbtiles'); // committed old → chartId 'old-prn'
       trackInstall('prn', CATALOG, '2024-06-10T00:00:00Z', 'https://example.com/new.mbtiles'); // begin update
 
-      initCatalogManager(TEST_DATA_DIR, () => {}); // restart → load auto-rolls-back to old-prn
+      await initCatalogManagerOffline(); // restart → load auto-rolls-back to old-prn
       // Startup then scans charts and prunes. The old file IS on disk, so its
       // chartId is present; pass it so prune keeps the recovered record.
       pruneStaleInstalls(['old-prn']);
@@ -541,9 +600,9 @@ describe('CatalogManager', () => {
       removeInstall('prn');
     });
 
-    it('survives a restart mid-fresh-install: pending record dropped on load', () => {
+    it('survives a restart mid-fresh-install: pending record dropped on load', async () => {
       trackInstall('frsh', CATALOG, '2024-01-01T00:00:00Z', 'https://example.com/a.mbtiles');
-      initCatalogManager(TEST_DATA_DIR, () => {}); // restart → load drops the never-committed fresh record
+      await initCatalogManagerOffline(); // restart → load drops the never-committed fresh record
       assert.strictEqual(getInstalledCatalogCharts()['frsh'], undefined);
     });
 
@@ -588,6 +647,174 @@ describe('CatalogManager', () => {
       assert.ok(result);
       assert.strictEqual(result.charts.length, 1);
       assert.strictEqual(result.charts[0]!.number, 'old1');
+    });
+  });
+
+  describe('fetchCatalogRegistry() rate-limit status', () => {
+    // Build a fake https.IncomingMessage and a fake ClientRequest, and stub
+    // https.get so fetchCatalogRegistry sees our scripted response.
+    interface FakeRes {
+      statusCode: number;
+      headers: Record<string, string>;
+      body?: string;
+    }
+    function stubHttps(res: FakeRes | { networkError: true }): void {
+      mock.method(https, 'get', (...args: unknown[]) => {
+        const cb = args[args.length - 1] as (r: unknown) => void;
+        const req = {
+          on(event: string, handler: (err: Error) => void) {
+            if ('networkError' in res && event === 'error') {
+              process.nextTick(() => handler(new Error('ENOTFOUND')));
+            }
+            return req;
+          },
+          setTimeout() {
+            return req;
+          },
+          destroy() {
+            /* no-op */
+          }
+        };
+        if (!('networkError' in res)) {
+          process.nextTick(() => {
+            const response = {
+              statusCode: res.statusCode,
+              headers: res.headers,
+              resume() {
+                /* drained */
+              },
+              on(event: string, handler: (chunk?: Buffer) => void) {
+                if (res.statusCode === 200) {
+                  if (event === 'data') {
+                    handler(Buffer.from(res.body ?? '[]'));
+                  }
+                  if (event === 'end') {
+                    handler();
+                  }
+                }
+                return response;
+              }
+            };
+            cb(response);
+          });
+        }
+        return req;
+      });
+    }
+
+    before(async () => {
+      // The outer before already drained the init fetch under a stub; this is
+      // belt-and-suspenders in case any prior fetch is still in flight. Stubbed
+      // so it can never make a live GitHub call.
+      stubHttpsEmpty200();
+      await fetchCatalogRegistry().catch(() => undefined);
+      mock.restoreAll();
+    });
+
+    afterEach(() => {
+      mock.restoreAll();
+    });
+
+    it('flags rate_limited and captures resetAt on a 403 with remaining 0', async () => {
+      stubHttps({
+        statusCode: 403,
+        headers: {
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset': '1749532800',
+          'retry-after': '3600'
+        }
+      });
+      await assert.rejects(fetchCatalogRegistry(), /GitHub API returned 403/);
+      const s = getRegistryStatus();
+      assert.strictEqual(s.status, 'rate_limited');
+      assert.strictEqual(s.isRateLimited, true);
+      assert.strictEqual(s.remaining, 0);
+      assert.strictEqual(s.resetAt, 1749532800 * 1000);
+      assert.strictEqual(s.retryAfter, 3600);
+      assert.strictEqual(s.httpStatus, 403);
+    });
+
+    it('a 403 WITHOUT remaining 0 is a generic error, not rate-limited', async () => {
+      stubHttps({ statusCode: 403, headers: { 'x-ratelimit-remaining': '12' } });
+      await assert.rejects(fetchCatalogRegistry());
+      const s = getRegistryStatus();
+      assert.strictEqual(s.isRateLimited, false);
+      assert.strictEqual(s.status, 'error');
+    });
+
+    it('a 200 clears the rate-limit flag, metadata, and records remaining', async () => {
+      // First a 403 that sets isRateLimited + resetAt + retryAfter...
+      stubHttps({
+        statusCode: 403,
+        headers: {
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset': '1749532800',
+          'retry-after': '3600'
+        }
+      });
+      await assert.rejects(fetchCatalogRegistry());
+      assert.strictEqual(getRegistryStatus().isRateLimited, true);
+      assert.strictEqual(getRegistryStatus().resetAt, 1749532800 * 1000);
+      mock.restoreAll();
+
+      // ...then a 200 must clear all of it, not just the flag, so a stale
+      // rate-limit banner can't slip through while status === 'ok'.
+      stubHttps({ statusCode: 200, headers: { 'x-ratelimit-remaining': '57' }, body: '[]' });
+      await fetchCatalogRegistry();
+      const s = getRegistryStatus();
+      assert.strictEqual(s.status, 'ok');
+      assert.strictEqual(s.isRateLimited, false);
+      assert.strictEqual(s.remaining, 57);
+      assert.strictEqual(s.resetAt, null, 'a success must clear the stale reset time');
+      assert.strictEqual(s.retryAfter, null, 'a success must clear the stale retry-after');
+    });
+
+    it('a network error is status error with null httpStatus (not rate-limited)', async () => {
+      stubHttps({ networkError: true });
+      await assert.rejects(fetchCatalogRegistry());
+      const s = getRegistryStatus();
+      assert.strictEqual(s.status, 'error');
+      assert.strictEqual(s.isRateLimited, false);
+      assert.strictEqual(s.httpStatus, null);
+    });
+
+    it('single-flight: two concurrent calls issue one https.get', async () => {
+      const getMock = mock.method(https, 'get', (...args: unknown[]) => {
+        const cb = args[args.length - 1] as (r: unknown) => void;
+        const req = {
+          on() {
+            return req;
+          },
+          setTimeout() {
+            return req;
+          },
+          destroy() {
+            /* no-op */
+          }
+        };
+        setTimeout(() => {
+          const response = {
+            statusCode: 200,
+            headers: {},
+            resume() {
+              /* drained */
+            },
+            on(event: string, handler: (chunk?: Buffer) => void) {
+              if (event === 'data') {
+                handler(Buffer.from('[]'));
+              }
+              if (event === 'end') {
+                handler();
+              }
+              return response;
+            }
+          };
+          cb(response);
+        }, 20);
+        return req;
+      });
+      await Promise.all([fetchCatalogRegistry(), fetchCatalogRegistry()]);
+      assert.strictEqual(getMock.mock.callCount(), 1);
     });
   });
 });

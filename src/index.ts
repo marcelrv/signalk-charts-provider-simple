@@ -11,12 +11,14 @@ import {
   checkForUpdates,
   classifyUrl,
   fetchCatalog,
+  fetchCatalogRegistry,
   getCachedCatalog,
   getCatalogRegistry,
   getCatalogsWithInstalledCharts,
   getConvertingCharts,
   getConvertingCount,
   getInstalledCatalogCharts,
+  getRegistryStatus,
   initCatalogManager,
   pruneStaleInstalls,
   removeInstall,
@@ -1791,11 +1793,43 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
         const registry = getCatalogRegistry();
         const installed = getInstalledCatalogCharts();
         const convertingCharts = getConvertingCharts();
-        res.json({ registry, installed, converting: convertingCharts });
+        res.json({
+          registry,
+          installed,
+          converting: convertingCharts,
+          registryStatus: getRegistryStatus()
+        });
       } catch (error) {
         console.error('Error fetching catalog registry:', error);
         res.status(500).json({ error: 'Failed to fetch catalog registry' });
       }
+    });
+
+    // Force a re-fetch of the catalog index from GitHub (the Refresh button).
+    // Awaits the fetch so the response reflects the just-attempted result, but
+    // swallows the rejection — registryStatus carries the reason (rate-limited
+    // / offline / error) so the UI can message accurately.
+    router.post('/catalog-registry/refresh', (_req: Request, res: Response) => {
+      void (async () => {
+        try {
+          await fetchCatalogRegistry().catch((err: unknown) => {
+            app.debug(
+              `Catalog registry refresh failed: ${err instanceof Error ? err.message : String(err)}`
+            );
+          });
+          res.json({
+            registry: getCatalogRegistry(),
+            installed: getInstalledCatalogCharts(),
+            converting: getConvertingCharts(),
+            registryStatus: getRegistryStatus()
+          });
+        } catch (error) {
+          // The refresh itself is awaited+swallowed above; this only fires if
+          // building the response throws.
+          console.error('Error building catalog refresh response:', error);
+          res.status(500).json({ error: 'Failed to build catalog refresh response' });
+        }
+      })();
     });
 
     router.get('/catalog-s57-status', (_req: Request, res: Response) => {

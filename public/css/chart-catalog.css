@@ -447,6 +447,65 @@ option.catalog-folder-option-new {
     font-size: 14px;
 }
 
+/* Rate-limit is a warning (tertiary), not an error (red): the device is
+ * online, just throttled by GitHub. */
+.catalog-error.catalog-error-rate-limit {
+    background: var(--md-sys-color-tertiary-container);
+    color: var(--md-sys-color-on-tertiary-container);
+}
+
+/* Catalog toolbar (Refresh button row) */
+.catalog-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: var(--md-sys-spacing-2);
+}
+
+.btn-catalog-refresh {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--md-sys-spacing-2);
+    padding: 8px 16px;
+    border: 1px solid var(--md-sys-color-outline-variant);
+    border-radius: var(--md-sys-shape-corner-full);
+    background: var(--md-sys-color-surface-container);
+    color: var(--md-sys-color-on-surface);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all var(--md-sys-motion-duration-short2) var(--md-sys-motion-easing-standard);
+}
+
+.btn-catalog-refresh:hover:not(:disabled) {
+    background: var(--md-sys-color-surface-container-high);
+    border-color: var(--md-sys-color-outline);
+}
+
+.btn-catalog-refresh:disabled {
+    opacity: 0.38;
+    cursor: not-allowed;
+}
+
+.btn-catalog-refresh.loading {
+    background: var(--md-sys-color-surface-container-highest);
+    color: var(--md-sys-color-on-surface-variant);
+}
+
+/* Non-destructive banner above a populated list (refresh failed / rate-limited
+ * while cached catalogs are still shown). */
+.catalog-banner {
+    padding: var(--md-sys-spacing-2) var(--md-sys-spacing-4);
+    border-radius: var(--md-sys-shape-corner-medium);
+    margin-bottom: var(--md-sys-spacing-4);
+    font-size: 13px;
+}
+
+.catalog-banner-warning {
+    background: var(--md-sys-color-tertiary-container);
+    color: var(--md-sys-color-on-tertiary-container);
+}
+
 /* Inline download / conversion progress.  Same flex/typography for both
  * pills; conversion has no progress bar (just spinner + message), download
  * has a thin bar.  Two separate classes so pollConversions can update the
