@@ -2,9 +2,13 @@
  * Tests for the catalog manager module
  */
 
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, mock } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
+// NOTE: the module under test imports from 'https' (not 'node:https'); ESM
+// treats those as separate module instances, so we must mock the SAME
+// specifier for the stub to intercept the dist module's https.get.
+import https from 'https';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,7 +24,9 @@ import {
   checkForUpdates,
   getCatalogsWithInstalledCharts,
   getCachedCatalog,
-  pruneStaleInstalls
+  pruneStaleInstalls,
+  fetchCatalogRegistry,
+  getRegistryStatus
 } from '../dist/utils/catalog-manager.js';
 import type { CatalogInstall } from '../dist/types.js';
 
@@ -588,6 +594,159 @@ describe('CatalogManager', () => {
       assert.ok(result);
       assert.strictEqual(result.charts.length, 1);
       assert.strictEqual(result.charts[0]!.number, 'old1');
+    });
+  });
+
+  describe('fetchCatalogRegistry() rate-limit status', () => {
+    // Build a fake https.IncomingMessage and a fake ClientRequest, and stub
+    // https.get so fetchCatalogRegistry sees our scripted response.
+    interface FakeRes {
+      statusCode: number;
+      headers: Record<string, string>;
+      body?: string;
+    }
+    function stubHttps(res: FakeRes | { networkError: true }): void {
+      mock.method(https, 'get', (...args: unknown[]) => {
+        const cb = args[args.length - 1] as (r: unknown) => void;
+        const req = {
+          on(event: string, handler: (err: Error) => void) {
+            if ('networkError' in res && event === 'error') {
+              process.nextTick(() => handler(new Error('ENOTFOUND')));
+            }
+            return req;
+          },
+          setTimeout() {
+            return req;
+          },
+          destroy() {
+            /* no-op */
+          }
+        };
+        if (!('networkError' in res)) {
+          process.nextTick(() => {
+            const response = {
+              statusCode: res.statusCode,
+              headers: res.headers,
+              resume() {
+                /* drained */
+              },
+              on(event: string, handler: (chunk?: Buffer) => void) {
+                if (res.statusCode === 200) {
+                  if (event === 'data') {
+                    handler(Buffer.from(res.body ?? '[]'));
+                  }
+                  if (event === 'end') {
+                    handler();
+                  }
+                }
+                return response;
+              }
+            };
+            cb(response);
+          });
+        }
+        return req;
+      });
+    }
+
+    before(async () => {
+      // initCatalogManager (outer before) fired a real, fire-and-forget
+      // fetch; single-flight would hand that in-progress promise to our
+      // first stubbed test. Drain it so each test below starts clean.
+      await fetchCatalogRegistry().catch(() => undefined);
+    });
+
+    after(() => {
+      mock.restoreAll();
+    });
+
+    it('flags rate_limited and captures resetAt on a 403 with remaining 0', async () => {
+      stubHttps({
+        statusCode: 403,
+        headers: {
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset': '1749532800',
+          'retry-after': '3600'
+        }
+      });
+      await assert.rejects(fetchCatalogRegistry(), /GitHub API returned 403/);
+      const s = getRegistryStatus();
+      assert.strictEqual(s.status, 'rate_limited');
+      assert.strictEqual(s.isRateLimited, true);
+      assert.strictEqual(s.remaining, 0);
+      assert.strictEqual(s.resetAt, 1749532800 * 1000);
+      assert.strictEqual(s.retryAfter, 3600);
+      assert.strictEqual(s.httpStatus, 403);
+      mock.restoreAll();
+    });
+
+    it('a 403 WITHOUT remaining 0 is a generic error, not rate-limited', async () => {
+      stubHttps({ statusCode: 403, headers: { 'x-ratelimit-remaining': '12' } });
+      await assert.rejects(fetchCatalogRegistry());
+      const s = getRegistryStatus();
+      assert.strictEqual(s.isRateLimited, false);
+      assert.strictEqual(s.status, 'error');
+      mock.restoreAll();
+    });
+
+    it('a 200 clears the rate-limit flag and records remaining', async () => {
+      stubHttps({ statusCode: 200, headers: { 'x-ratelimit-remaining': '57' }, body: '[]' });
+      await fetchCatalogRegistry();
+      const s = getRegistryStatus();
+      assert.strictEqual(s.status, 'ok');
+      assert.strictEqual(s.isRateLimited, false);
+      assert.strictEqual(s.remaining, 57);
+      mock.restoreAll();
+    });
+
+    it('a network error is status error with null httpStatus (not rate-limited)', async () => {
+      stubHttps({ networkError: true });
+      await assert.rejects(fetchCatalogRegistry());
+      const s = getRegistryStatus();
+      assert.strictEqual(s.status, 'error');
+      assert.strictEqual(s.isRateLimited, false);
+      assert.strictEqual(s.httpStatus, null);
+      mock.restoreAll();
+    });
+
+    it('single-flight: two concurrent calls issue one https.get', async () => {
+      const getMock = mock.method(https, 'get', (...args: unknown[]) => {
+        const cb = args[args.length - 1] as (r: unknown) => void;
+        const req = {
+          on() {
+            return req;
+          },
+          setTimeout() {
+            return req;
+          },
+          destroy() {
+            /* no-op */
+          }
+        };
+        setTimeout(() => {
+          const response = {
+            statusCode: 200,
+            headers: {},
+            resume() {
+              /* drained */
+            },
+            on(event: string, handler: (chunk?: Buffer) => void) {
+              if (event === 'data') {
+                handler(Buffer.from('[]'));
+              }
+              if (event === 'end') {
+                handler();
+              }
+              return response;
+            }
+          };
+          cb(response);
+        }, 20);
+        return req;
+      });
+      await Promise.all([fetchCatalogRegistry(), fetchCatalogRegistry()]);
+      assert.strictEqual(getMock.mock.callCount(), 1);
+      mock.restoreAll();
     });
   });
 });

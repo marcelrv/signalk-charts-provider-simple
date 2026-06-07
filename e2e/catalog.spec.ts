@@ -215,4 +215,121 @@ test.describe('Chart Catalog tab', () => {
     // and refresh the updates list, removing the row live — no tab reload.
     await expect(row).toHaveCount(0, { timeout: 10_000 });
   });
+
+  test('shows a Refresh button in the catalog toolbar', async ({ page }) => {
+    await page.goto('/plugins/signalk-charts-provider-simple/');
+    await setMockState(page, { registry: [] });
+    await page.getByRole('button', { name: /Chart Catalog/i }).click();
+    await expect(page.locator('[data-catalog-refresh]')).toBeVisible();
+  });
+
+  test('rate-limited empty registry shows warning copy + reset time, not "offline"', async ({
+    page
+  }) => {
+    await page.goto('/plugins/signalk-charts-provider-simple/');
+    const resetAt = Date.now() + 42 * 60_000;
+    await setMockState(page, {
+      registry: [],
+      registryStatus: {
+        status: 'rate_limited',
+        isRateLimited: true,
+        remaining: 0,
+        resetAt,
+        retryAfter: 3600,
+        lastAttemptAt: Date.now(),
+        lastSuccessAt: null,
+        httpStatus: 403
+      }
+    });
+    await page.getByRole('button', { name: /Chart Catalog/i }).click();
+
+    const msg = page.locator('.catalog-error-rate-limit');
+    await expect(msg).toBeVisible();
+    await expect(msg).toContainText(/GitHub rate limit reached/i);
+    await expect(msg).not.toContainText(/offline/i);
+    await expect(msg).toContainText(/in about \d+ minutes?/);
+  });
+
+  test('a failed (rate-limited) refresh keeps the cached cards, shows a banner', async ({
+    page
+  }) => {
+    await page.goto('/plugins/signalk-charts-provider-simple/');
+    // Start populated; script the refresh to come back empty + rate-limited.
+    await setMockState(page, {
+      registry: [
+        {
+          file: 'DE_IENC.xml',
+          label: 'Germany Inland ENC',
+          category: 'ienc',
+          chartCount: 3,
+          cachedAt: '2026-05-07T10:00:00Z'
+        }
+      ],
+      refreshRegistry: [],
+      refreshStatus: {
+        status: 'rate_limited',
+        isRateLimited: true,
+        remaining: 0,
+        resetAt: Date.now() + 3_600_000,
+        retryAfter: 3600,
+        lastAttemptAt: Date.now(),
+        lastSuccessAt: null,
+        httpStatus: 403
+      }
+    });
+    await page.getByRole('button', { name: /Chart Catalog/i }).click();
+    await expect(page.locator('.catalog-card')).toHaveCount(1);
+
+    await page.locator('[data-catalog-refresh]').click();
+
+    // Cards must NOT be blanked; a non-destructive banner explains why.
+    await expect(page.locator('.catalog-card')).toHaveCount(1);
+    await expect(page.locator('#catalogRegistryBanner .catalog-banner-warning')).toContainText(
+      /cached catalogs/i
+    );
+  });
+
+  test('a successful refresh populates the list and clears any banner', async ({ page }) => {
+    await page.goto('/plugins/signalk-charts-provider-simple/');
+    await setMockState(page, {
+      registry: [],
+      registryStatus: {
+        status: 'error',
+        isRateLimited: false,
+        remaining: null,
+        resetAt: null,
+        retryAfter: null,
+        lastAttemptAt: Date.now(),
+        lastSuccessAt: null,
+        httpStatus: null
+      },
+      refreshRegistry: [
+        {
+          file: 'NL_IENC.xml',
+          label: 'Netherlands Inland ENC',
+          category: 'ienc',
+          chartCount: 5,
+          cachedAt: '2026-05-07T10:00:00Z'
+        }
+      ],
+      refreshStatus: {
+        status: 'ok',
+        isRateLimited: false,
+        remaining: 49,
+        resetAt: null,
+        retryAfter: null,
+        lastAttemptAt: Date.now(),
+        lastSuccessAt: Date.now(),
+        httpStatus: 200
+      }
+    });
+    await page.getByRole('button', { name: /Chart Catalog/i }).click();
+    // Empty + error first.
+    await expect(page.locator('.catalog-error')).toBeVisible();
+
+    await page.locator('[data-catalog-refresh]').click();
+
+    await expect(page.locator('.catalog-card')).toHaveCount(1);
+    await expect(page.locator('#catalogRegistryBanner')).toBeEmpty();
+  });
 });

@@ -34,10 +34,24 @@ interface CatalogInstall {
   catalogFile: string;
 }
 
+type RegistryFetchStatus = 'ok' | 'rate_limited' | 'error' | 'never';
+
+interface RegistryStatus {
+  status: RegistryFetchStatus;
+  isRateLimited: boolean;
+  remaining: number | null;
+  resetAt: number | null; // epoch ms
+  retryAfter: number | null; // seconds
+  lastAttemptAt: number | null;
+  lastSuccessAt: number | null;
+  httpStatus: number | null;
+}
+
 interface CatalogRegistryResponse {
   registry?: CatalogRegistryEntry[];
   installed?: Record<string, CatalogInstall>;
   converting?: Record<string, boolean>;
+  registryStatus?: RegistryStatus;
 }
 
 interface LocalChartsResponse {
@@ -195,6 +209,12 @@ async function initCatalogTab(): Promise<void> {
       </div>
       <div id="catalogPodmanWarning"></div>
       <div id="catalogUpdatesSection"></div>
+      <div id="catalogToolbar" class="catalog-toolbar">
+        <button type="button" class="btn-catalog-refresh" data-catalog-refresh title="Re-fetch the catalog index from GitHub">
+          <span class="btn-catalog-refresh-label">Refresh catalog index</span>
+        </button>
+      </div>
+      <div id="catalogRegistryBanner"></div>
       <div id="catalogFilterBar"></div>
       <div id="catalogList">
         <div class="catalog-loading">
@@ -330,6 +350,13 @@ function wireCatalogClickHandlers(): void {
         return;
       }
 
+      // Refresh button - force a re-fetch of the catalog index from GitHub.
+      const refreshBtn = target.closest<HTMLButtonElement>('[data-catalog-refresh]');
+      if (refreshBtn) {
+        void doCatalogRefresh(refreshBtn);
+        return;
+      }
+
       // "Update All" button - queue updates for sequential processing
       const updateAll = target.closest<HTMLElement>('[data-catalog-update-all]');
       if (updateAll) {
@@ -413,39 +440,173 @@ function wireCatalogClickHandlers(): void {
   }
 }
 
+// Bumped by every registry load/refresh; a stale async result whose seq no
+// longer matches is ignored, so a slow initial load can't clobber a newer
+// refresh (or vice versa).
+let registryLoadSeq = 0;
+let catalogRefreshInFlight = false;
+// Last status from the registry endpoint, so renderCatalogList() can show an
+// accurate empty-state message (rate-limited / offline) instead of a generic
+// "No catalogs" that would clobber it on the next poll-driven re-render.
+let lastRegistryStatus: RegistryStatus | undefined;
+
+// Human-friendly "try again …" from the rate-limit reset time. Uses LOCAL
+// time (never UTC) plus a relative hint; falls back to retry-after / "shortly".
+function formatRateLimitReset(status: RegistryStatus): string {
+  const { resetAt, retryAfter } = status;
+  if (!resetAt) {
+    if (retryAfter) {
+      const mins = Math.max(1, Math.ceil(retryAfter / 60));
+      return `in about ${mins} minute${mins === 1 ? '' : 's'}`;
+    }
+    return 'shortly';
+  }
+  const local = new Date(resetAt).toLocaleTimeString(undefined, {
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+  const mins = Math.max(0, Math.ceil((resetAt - Date.now()) / 60000));
+  return mins > 0
+    ? `at ${local} (in about ${mins} minute${mins === 1 ? '' : 's'})`
+    : `at ${local}`;
+}
+
+// HTML for the empty-list placeholder, classed so CSS tints rate-limit
+// (warning) vs offline/error differently. Crucially never says "offline" for
+// a rate-limit.
+function registryEmptyMessageHtml(status: RegistryStatus | undefined): string {
+  if (status?.isRateLimited) {
+    return `<div class="catalog-error catalog-error-rate-limit"><strong>GitHub rate limit reached.</strong> The chart catalog index is fetched from GitHub, which limits anonymous requests. Please try again ${formatRateLimitReset(status)}, then click Refresh.</div>`;
+  }
+  if (status?.status === 'error') {
+    return `<div class="catalog-error">Could not fetch the chart catalog index from GitHub. Check this device's internet connection, then click Refresh. Previously cached catalogs reappear once it succeeds.</div>`;
+  }
+  return `<div class="catalog-error">No catalogs available yet. Click Refresh to fetch the catalog index from GitHub.</div>`;
+}
+
+// Non-destructive banner shown ABOVE a populated list when a refresh failed —
+// so we never blank the cached cards just to report the failure.
+function showRegistryBanner(status: RegistryStatus | undefined): void {
+  const el = document.getElementById('catalogRegistryBanner');
+  if (!el) {
+    return;
+  }
+  const msg = status?.isRateLimited
+    ? `Showing cached catalogs. GitHub rate limit reached — try refresh again ${formatRateLimitReset(status)}.`
+    : 'Showing cached catalogs. Could not reach GitHub to refresh the index.';
+  el.innerHTML = `<div class="catalog-banner catalog-banner-warning">${msg}</div>`;
+}
+
+function clearRegistryBanner(): void {
+  const el = document.getElementById('catalogRegistryBanner');
+  if (el) {
+    el.innerHTML = '';
+  }
+}
+
+// Apply a registry response: never replace a populated list with an empty one
+// (keep cached cards + show a banner instead); render the accurate empty/error
+// placeholder only when there's nothing cached to show.
+function applyRegistryResponse(data: CatalogRegistryResponse): void {
+  const incoming = data.registry ?? [];
+  const status = data.registryStatus;
+  lastRegistryStatus = status;
+
+  if (incoming.length === 0 && catalogRegistry.length > 0) {
+    showRegistryBanner(status);
+    return;
+  }
+
+  catalogRegistry = incoming;
+  catalogInstalled = data.installed ?? {};
+  catalogConverting = data.converting ?? {};
+  renderFilterBar();
+  // renderCatalogList handles both the populated and empty-registry cases
+  // (the latter via registryEmptyMessageHtml + lastRegistryStatus), so a
+  // later poll-driven re-render keeps showing the right message.
+  renderCatalogList();
+}
+
 /**
- * Returns true on a successful registry refresh, false on network/HTTP
- * failure. Callers that chain follow-up renders need to skip them on
- * failure so the .catalog-error message this function writes into
- * #catalogList isn't overwritten with stale cards.
+ * Returns true on a successful registry load, false on network/HTTP failure
+ * to OUR endpoint. Callers that chain follow-up renders skip them on failure.
+ * Never blanks an already-populated list.
  */
 async function loadCatalogRegistry(): Promise<boolean> {
+  const seq = ++registryLoadSeq;
   try {
     const response = await fetch(`${CATALOG_API_BASE}/catalog-registry`);
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
     const data = (await response.json()) as CatalogRegistryResponse;
-    catalogRegistry = data.registry ?? [];
-    catalogInstalled = data.installed ?? {};
-    catalogConverting = data.converting ?? {};
-    renderFilterBar();
-    if (catalogRegistry.length === 0) {
-      const listEl = document.getElementById('catalogList');
-      if (listEl) {
-        listEl.innerHTML = `<div class="catalog-error">No catalogs available. The catalog index could not be fetched — you may be offline. Previously cached catalogs will appear after reconnecting.</div>`;
-      }
-    } else {
-      renderCatalogList();
+    if (seq !== registryLoadSeq) {
+      return true; // a newer load/refresh superseded this one
     }
+    applyRegistryResponse(data);
     return true;
   } catch (error) {
     console.error('Failed to load catalog registry:', error);
-    const listEl = document.getElementById('catalogList');
-    if (listEl) {
-      listEl.innerHTML = `<div class="catalog-error">Failed to load catalog registry. You may be offline.</div>`;
+    if (seq !== registryLoadSeq) {
+      return false;
+    }
+    // Failure reaching OUR server (not GitHub). Keep a populated list.
+    if (catalogRegistry.length === 0) {
+      const listEl = document.getElementById('catalogList');
+      if (listEl) {
+        listEl.innerHTML = `<div class="catalog-error">Failed to load the catalog list from the Signal K server. Reload the page or click Refresh.</div>`;
+      }
+    } else {
+      showRegistryBanner(undefined);
     }
     return false;
+  }
+}
+
+// Refresh-button handler: force a GitHub re-fetch on demand, with a disabled/
+// spinner state and the same never-blank + stale-guard rules as the load path.
+async function doCatalogRefresh(btn: HTMLButtonElement): Promise<void> {
+  if (catalogRefreshInFlight) {
+    return;
+  }
+  catalogRefreshInFlight = true;
+  const seq = ++registryLoadSeq;
+  const label = btn.querySelector<HTMLElement>('.btn-catalog-refresh-label');
+  const prevText = label?.textContent ?? 'Refresh catalog index';
+  btn.disabled = true;
+  btn.classList.add('loading');
+  if (label) {
+    label.textContent = 'Refreshing…';
+  }
+  try {
+    const response = await fetch(`${CATALOG_API_BASE}/catalog-registry/refresh`, {
+      method: 'POST'
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const data = (await response.json()) as CatalogRegistryResponse;
+    if (seq !== registryLoadSeq) {
+      return;
+    }
+    applyRegistryResponse(data);
+  } catch (error) {
+    console.error('Catalog refresh failed:', error);
+    if (catalogRegistry.length > 0) {
+      showRegistryBanner(undefined);
+    } else {
+      const listEl = document.getElementById('catalogList');
+      if (listEl) {
+        listEl.innerHTML = `<div class="catalog-error">Refresh failed — could not reach the Signal K server.</div>`;
+      }
+    }
+  } finally {
+    catalogRefreshInFlight = false;
+    btn.disabled = false;
+    btn.classList.remove('loading');
+    if (label) {
+      label.textContent = prevText;
+    }
   }
 }
 
@@ -818,6 +979,17 @@ function renderCatalogList(): void {
   if (!listEl) {
     return;
   }
+  // Whole registry empty → show the status-aware reason (rate-limited /
+  // offline / "click Refresh"), not a generic line that would clobber the
+  // message a poll-driven re-render would otherwise wipe.
+  if (catalogRegistry.length === 0) {
+    listEl.innerHTML = registryEmptyMessageHtml(lastRegistryStatus);
+    return;
+  }
+
+  // A successful populated render means the registry is fine — drop any
+  // stale "showing cached catalogs" banner from a prior failed refresh.
+  clearRegistryBanner();
 
   const filtered =
     activeCategoryFilter === 'all'

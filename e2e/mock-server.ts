@@ -28,6 +28,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Mock state.  Each top-level key is what the corresponding REST
 // endpoint returns.  Tests overwrite via PUT /__mock/state, partial
 // updates merge; full reset via POST /__mock/reset.
+interface RegistryStatusMock {
+  status: 'ok' | 'rate_limited' | 'error' | 'never';
+  isRateLimited: boolean;
+  remaining: number | null;
+  resetAt: number | null;
+  retryAfter: number | null;
+  lastAttemptAt: number | null;
+  lastSuccessAt: number | null;
+  httpStatus: number | null;
+}
+
 interface MockState {
   registry: {
     file: string;
@@ -36,6 +47,12 @@ interface MockState {
     chartCount: number | null;
     cachedAt: string | null;
   }[];
+  // Status surfaced with the registry; tests set this to drive rate-limit UI.
+  registryStatus: RegistryStatusMock;
+  // When set, POST /catalog-registry/refresh swaps the registry to this (and
+  // optionally a new status) — lets a test script a refresh outcome.
+  refreshRegistry: MockState['registry'] | null;
+  refreshStatus: RegistryStatusMock | null;
   installed: Record<
     string,
     { catalogFile: string; zipfile_datetime_iso8601: string; installedAt: string }
@@ -95,8 +112,22 @@ interface MockState {
   containerRuntimeEngine: string | null;
 }
 
+const okStatus: RegistryStatusMock = {
+  status: 'ok',
+  isRateLimited: false,
+  remaining: 50,
+  resetAt: null,
+  retryAfter: null,
+  lastAttemptAt: null,
+  lastSuccessAt: null,
+  httpStatus: 200
+};
+
 const initialState: MockState = {
   registry: [],
+  registryStatus: okStatus,
+  refreshRegistry: null,
+  refreshStatus: null,
   installed: {},
   converting: {},
   conversions: {},
@@ -163,7 +194,24 @@ export function startMockServer(
     res.json({
       registry: state.registry,
       installed: state.installed,
-      converting: state.converting
+      converting: state.converting,
+      registryStatus: state.registryStatus
+    });
+  });
+
+  router.post(`${PLUGIN_BASE}/catalog-registry/refresh`, (_req, res) => {
+    // Apply the scripted refresh outcome, if a test set one.
+    if (state.refreshRegistry !== null) {
+      state.registry = state.refreshRegistry;
+    }
+    if (state.refreshStatus !== null) {
+      state.registryStatus = state.refreshStatus;
+    }
+    res.json({
+      registry: state.registry,
+      installed: state.installed,
+      converting: state.converting,
+      registryStatus: state.registryStatus
     });
   });
 
