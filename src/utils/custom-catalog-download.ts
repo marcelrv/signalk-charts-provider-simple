@@ -69,6 +69,7 @@ function downloadToFile(url: string, dest: string, redirectsLeft = 5): Promise<v
       });
       response.on('error', (err) => {
         file.destroy();
+        fs.unlink(dest, () => {});
         reject(err);
       });
     });

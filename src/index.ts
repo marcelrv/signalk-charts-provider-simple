@@ -3194,6 +3194,18 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
           `Downloaded ${result.staged.length}/${inclusion.includedChartIds.length} ENC(s)` +
             (result.failed.length > 0 ? `, ${result.failed.length} failed` : '')
         );
+        // A partial download yields an MBTiles that omits the failed cells, so
+        // it must not be marked up-to-date (see the status decision after
+        // conversion below).
+        const partialDownload = result.failed.length > 0;
+        if (partialDownload) {
+          appendCatalogLog(
+            id,
+            `WARNING: ${result.failed.length} cell(s) failed to download: ` +
+              `${result.failed.map((f) => f.chartId).join(', ')} — the built chart will be ` +
+              `incomplete and stay flagged for rebuild.`
+          );
+        }
 
         // Persist the downloaded snapshot before conversion so a crash leaves
         // a coherent record the user can retry from.
@@ -3213,6 +3225,17 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
           sectionLabel: 'Starting conversion…',
           sectionPercent: -1
         });
+        // Re-check the conversion budget right before claiming a slot. The
+        // admission check at request time ran before the (long) download, so
+        // several catalogs could have passed it and now be ready to convert
+        // together. This synchronous check + setConvertingState pair is atomic
+        // in the event loop, so it can't over-subscribe maxConcurrentConversions.
+        const convertBudgetMax = getCpuBudget().maxConcurrentConversions;
+        if (getConvertingCount() >= convertBudgetMax) {
+          throw new Error(
+            `Too many conversions running (max ${convertBudgetMax}). Please retry when one finishes.`
+          );
+        }
         setConvertingState(id, true);
         convertingFlagged = true;
         quarantineDir = makeQuarantineDir(app.getDataDirPath(), id);
@@ -3260,7 +3283,10 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
 
         catalog.convertedChartPath = conv.mbtilesFile;
         catalog.lastConvertedAt = new Date().toISOString();
-        catalog.status = 'converted';
+        // Only a complete bundle counts as up-to-date. A partial download
+        // produced a chart that omits some cells, so leave it out_of_date and
+        // the UI flags it for a rebuild (which retries the failed cells).
+        catalog.status = partialDownload ? 'out_of_date' : 'converted';
         saveCustomCatalog(catalog);
 
         await refreshChartProviders();

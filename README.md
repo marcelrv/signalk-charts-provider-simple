@@ -94,7 +94,7 @@ The interface provides five tabs:
    - Download & convert produces one `.mbtiles` per chart set, with live progress and a log
    - Out-of-date detection when NOAA publishes new editions or your selection changes
    - Container runtime (`signalk-container`) required, same as other conversions
-   - NOAA is currently the only source of freely-downloadable ENC charts, so this is US-only
+   - US waters only — NOAA is the only source of freely-downloadable ENC charts
 
 ### Supported Formats
 

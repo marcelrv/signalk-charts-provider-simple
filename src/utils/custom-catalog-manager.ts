@@ -352,7 +352,9 @@ export function evaluateFreshness(
     effectiveStatus = 'out_of_date';
   }
 
-  return { upToDate, reasons, recomputed, effectiveStatus };
+  // A selected band-4 chart is also in the recomputed included set, so an
+  // edition change can be pushed by both loops above — de-dupe for display.
+  return { upToDate, reasons: [...new Set(reasons)], recomputed, effectiveStatus };
 }
 
 // ---- Per-catalog progress (download + convert) ----

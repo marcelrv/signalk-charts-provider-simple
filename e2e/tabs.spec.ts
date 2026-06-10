@@ -4,7 +4,6 @@ test.describe('tabs', () => {
   test('app loads with Manage Charts tab active by default', async ({ page }) => {
     await page.goto('/plugins/signalk-charts-provider-simple/');
 
-    // The five named tab buttons should all be present.
     await expect(page.getByRole('button', { name: /Manage Charts/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /Download from URL/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /Convert/i })).toBeVisible();

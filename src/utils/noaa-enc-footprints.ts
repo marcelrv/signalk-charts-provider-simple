@@ -92,6 +92,11 @@ function mercToLat(y: number): number {
  * EPSG:3857 (metres), but we guard defensively: a pair already in lon/lat
  * range is passed through unchanged, so the parser still works if NOAA ever
  * switches the file to 4326.
+ *
+ * Caveat: this lon/lat-range heuristic also matches genuine EPSG:3857 metres
+ * very close to the origin (|x| ≤ 360 m, |y| ≤ 90 m — a ~360 m patch off the
+ * Gulf of Guinea). That would be mis-passed-through, but NOAA US-waters
+ * footprints are nowhere near (0,0), so it can't occur with this data set.
  */
 export function projectCoord(x: number, y: number): [number, number] {
   if (Math.abs(x) <= 360 && Math.abs(y) <= 90) {
@@ -328,6 +333,7 @@ const CACHE_DIR_NAME = 'noaa-enc-cache';
 const CACHE_FILE_NAME = 'enc.geojson';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const MAX_FETCH_BYTES = 256 * 1024 * 1024; // hard ceiling so a bad upstream can't OOM us
+const FETCH_TIMEOUT_MS = 60000; // bail if NOAA stalls (connection up, no data)
 
 let dataDir = '';
 let debug: DebugFunction = () => {};
@@ -356,8 +362,8 @@ function buildIndex(geojson: unknown, fetchedAt: number, stale: boolean): Footpr
 
 function fetchText(url: string, redirectsLeft = 5): Promise<string> {
   return new Promise<string>((resolve, reject) => {
-    https
-      .get(url, (response) => {
+    const req = https
+      .get(url, { timeout: FETCH_TIMEOUT_MS }, (response) => {
         const status = response.statusCode ?? 0;
         if (status >= 300 && status < 400 && response.headers.location) {
           response.resume();
@@ -390,6 +396,9 @@ function fetchText(url: string, redirectsLeft = 5): Promise<string> {
         response.on('error', reject);
       })
       .on('error', reject);
+    // 'timeout' fires on inactivity but doesn't abort by itself; destroy with
+    // an error so the .on('error') handler rejects.
+    req.on('timeout', () => req.destroy(new Error('NOAA enc.geojson request timed out')));
   });
 }
 
