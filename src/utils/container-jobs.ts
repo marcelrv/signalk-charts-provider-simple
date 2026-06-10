@@ -19,7 +19,11 @@
  */
 
 import { getContainerManager } from './container-manager.js';
-import type { ContainerManagerApi, ContainerResourceLimits } from './container-manager.js';
+import type {
+  ContainerJobResult,
+  ContainerManagerApi,
+  ContainerResourceLimits
+} from './container-manager.js';
 
 function requireManager(): ContainerManagerApi {
   const manager = getContainerManager();
@@ -84,6 +88,14 @@ export interface JobRunResult {
   exitCode: number;
   /** Combined stdout+stderr lines, in the order they were emitted. */
   log: string[];
+  /**
+   * signalk-container's failure reason, when it set one — e.g. the
+   * exception text when `container.wait()` threw. Distinct from a non-zero
+   * GDAL exit captured in `log`; surfaced so the two are distinguishable.
+   */
+  error?: string;
+  /** Terminal job status from signalk-container (`completed` / `failed` / …). */
+  status?: ContainerJobResult['status'];
 }
 
 /**
@@ -171,7 +183,9 @@ export async function runJob(opts: JobRunOptions): Promise<JobRunResult> {
   });
   return {
     exitCode: result.exitCode ?? 1,
-    log: result.log
+    log: result.log,
+    error: result.error,
+    status: result.status
   };
 }
 
