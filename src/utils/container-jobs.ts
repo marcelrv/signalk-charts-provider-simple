@@ -19,7 +19,11 @@
  */
 
 import { getContainerManager } from './container-manager.js';
-import type { ContainerManagerApi, ContainerResourceLimits } from './container-manager.js';
+import type {
+  ContainerJobResult,
+  ContainerManagerApi,
+  ContainerResourceLimits
+} from './container-manager.js';
 
 function requireManager(): ContainerManagerApi {
   const manager = getContainerManager();
@@ -91,7 +95,7 @@ export interface JobRunResult {
    */
   error?: string;
   /** Terminal job status from signalk-container (`completed` / `failed` / …). */
-  status?: string;
+  status?: ContainerJobResult['status'];
 }
 
 /**
