@@ -50,7 +50,10 @@ function downloadToFile(url: string, dest: string, redirectsLeft = 5): Promise<v
           reject(new Error('too many redirects'));
           return;
         }
-        downloadToFile(response.headers.location, dest, redirectsLeft - 1)
+        // Resolve against the current URL so a relative Location follows
+        // correctly instead of failing as a bare path.
+        const next = new URL(response.headers.location, url).toString();
+        downloadToFile(next, dest, redirectsLeft - 1)
           .then(resolve)
           .catch(reject);
         return;

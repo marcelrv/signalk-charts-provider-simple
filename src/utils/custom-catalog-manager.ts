@@ -273,8 +273,12 @@ export function deleteCustomCatalog(id: string): boolean {
     return false;
   }
   fs.unlinkSync(file);
+  // Drop ALL in-memory state for this id so a recreated chart set with the
+  // same slug can't inherit the prior run's progress/detail/cancel flags.
   delete catalogProgress[id];
+  delete catalogDetail[id];
   busyCatalogs.delete(id);
+  cancelRequested.delete(id);
   return true;
 }
 

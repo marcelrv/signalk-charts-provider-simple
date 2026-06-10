@@ -371,7 +371,10 @@ function fetchText(url: string, redirectsLeft = 5): Promise<string> {
             reject(new Error('Too many redirects fetching NOAA enc.geojson'));
             return;
           }
-          fetchText(response.headers.location, redirectsLeft - 1)
+          // Resolve against the current URL so a relative Location (RFC 7231
+          // allows it) follows correctly instead of failing as a bare path.
+          const next = new URL(response.headers.location, url).toString();
+          fetchText(next, redirectsLeft - 1)
             .then(resolve)
             .catch(reject);
           return;
