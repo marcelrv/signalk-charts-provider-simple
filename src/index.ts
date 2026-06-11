@@ -91,6 +91,7 @@ import {
   isCatalogCancelRequested,
   isValidCatalogId,
   listCustomCatalogs,
+  registerCatalogAbort,
   requestCatalogCancel,
   saveCustomCatalog,
   setCatalogBusy,
@@ -2554,8 +2555,15 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
       }
       requestCatalogCancel(id);
       setCatalogProgress(id, 'cancelling', 'Cancelling…');
-      // Downloads stop between charts immediately; a conversion stops at the
-      // next band boundary (the in-flight container job can't be force-killed).
+      // Reflect it in the structured detail immediately so the next /status
+      // poll shows "Cancelling…" rather than the last conversion frame.
+      setCatalogDetail(id, {
+        phase: 'cancelling',
+        sectionLabel: 'Cancelling…',
+        sectionPercent: -1
+      });
+      // Aborts the in-flight container job on signalk-container >= 1.16.0;
+      // downloads stop between charts; older containers stop at a band boundary.
       res.json({ success: true, message: 'Cancellation requested' });
     });
 
@@ -3105,6 +3113,9 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
         boxStates: {}
       };
     }
+    const mbtilesPresent =
+      catalog.convertedChartPath !== null &&
+      fs.existsSync(path.join(chartPath, catalog.convertedChartPath));
     const freshness = evaluateFreshness(catalog, index, (rel) =>
       fs.existsSync(path.join(chartPath, rel))
     );
@@ -3113,9 +3124,10 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
       effectiveStatus: freshness.effectiveStatus,
       includedCount: freshness.recomputed.includedChartIds.length,
       updateReasons: freshness.reasons,
-      // Per-box freshness by NOAA edition (independent of whether the source
-      // ZIPs still exist on disk — they're cleaned up after conversion).
-      boxStates: boxStatesForCatalog(catalog, index)
+      // Per-box freshness by NOAA edition. A box is green only when the set is
+      // cleanly converted and its MBTiles exists — a cancelled/failed build or
+      // a deleted output shows red, matching the catalog-level status.
+      boxStates: boxStatesForCatalog(catalog, index, mbtilesPresent)
     };
   }
 
@@ -3138,6 +3150,11 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
       downloadedChartIds: []
     });
     const stagedSoFar: string[] = [];
+
+    // Abort controller for mid-job cancel: requestCatalogCancel(id) aborts it,
+    // which kills the in-flight container job on signalk-container >= 1.16.0.
+    const abortController = new AbortController();
+    registerCatalogAbort(id, abortController);
 
     const stagingRoot = path.join(app.getDataDirPath(), `custom-catalog-${Date.now()}`);
     const encDir = path.join(stagingRoot, 'enc');
@@ -3264,31 +3281,52 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
             displayName: catalog.name,
             displayDescription: `Custom catalog: ${catalog.name}`,
             isAborted: () => isCatalogCancelRequested(id),
+            // Overall (convert-only) bar treats the per-band tippecanoe passes
+            // plus the final combine as equal slices, so it rises monotonically
+            // through the whole conversion. The combine now reports its own %
+            // (derived from tile-join's tile-coordinate output), so its section
+            // bar is determinate too.
             onProgress: (p) => {
-              // Overall bar is convert-only: each bucket is an equal slice,
-              // advanced by that bucket's tippecanoe %. Join sits near 100%.
-              const tilePct = p.bucketPercent >= 0 ? p.bucketPercent : 0;
-              const overall =
-                p.stage === 'join'
-                  ? 99
-                  : p.bucketCount > 0
-                    ? Math.round(((p.bucketIndex - 1 + tilePct / 100) / p.bucketCount) * 100)
-                    : 0;
+              // Once cancel is requested, the in-flight job is being killed but
+              // may emit a few more progress lines before it dies. Don't let
+              // those overwrite the "Cancelling…" state — otherwise the UI
+              // flips back to "running" until the job actually unwinds.
+              if (isCatalogCancelRequested(id)) {
+                setCatalogDetail(id, {
+                  phase: 'cancelling',
+                  sectionLabel: 'Cancelling…',
+                  sectionPercent: -1
+                });
+                return;
+              }
+              const hasJoin = p.bucketCount >= 2;
+              const denom = p.bucketCount + (hasJoin ? 1 : 0);
+              const pct = p.bucketPercent >= 0 ? p.bucketPercent : 0;
+              let overall: number;
               let sectionLabel: string;
+              let sectionPercent: number;
               if (p.stage === 'join') {
-                sectionLabel = `Combining ${p.bucketCount} tile sets — this can take a while and can't be interrupted`;
+                overall = denom > 0 ? Math.round(((p.bucketCount + pct / 100) / denom) * 100) : 99;
+                sectionLabel = `Combining ${p.bucketCount} tile sets`;
+                sectionPercent = p.bucketPercent;
               } else if (p.stage === 'export') {
+                overall = denom > 0 ? Math.round(((p.bucketIndex - 1) / denom) * 100) : 0;
                 sectionLabel = `${p.bucketLabel} — reading charts (${p.bucketIndex} of ${p.bucketCount})`;
+                sectionPercent = -1;
               } else {
+                overall =
+                  denom > 0 ? Math.round(((p.bucketIndex - 1 + pct / 100) / denom) * 100) : 0;
                 sectionLabel = `${p.bucketLabel} — generating tiles (${p.bucketIndex} of ${p.bucketCount})`;
+                sectionPercent = Math.round(pct);
               }
               setCatalogDetail(id, {
                 phase: p.stage === 'join' ? 'joining' : 'converting',
                 overallPercent: overall,
                 sectionLabel,
-                sectionPercent: p.stage === 'tiles' ? Math.round(tilePct) : -1
+                sectionPercent
               });
-            }
+            },
+            signal: abortController.signal
           },
           stagingRoot
         );

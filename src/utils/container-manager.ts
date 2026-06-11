@@ -82,6 +82,14 @@ export interface ContainerJobConfig {
    * Available in signalk-container >= 1.4.0.
    */
   user?: { inImageUid?: number; inImageGid?: number } | false;
+  /**
+   * Abort a running job. When the signal fires, signalk-container
+   * force-removes the container and the job resolves with
+   * `status: 'cancelled'`. Available in signalk-container >= 1.16.0;
+   * older versions ignore the field, so the caller falls back to
+   * boundary-level cancel (stop dispatching the next job).
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -102,7 +110,8 @@ export interface CleanupOrphansResult {
 }
 
 export interface ContainerJobResult {
-  status: 'pending' | 'pulling' | 'running' | 'completed' | 'failed';
+  // 'cancelled' added in signalk-container >= 1.16.0 (abort signal).
+  status: 'pending' | 'pulling' | 'running' | 'completed' | 'failed' | 'cancelled';
   exitCode?: number;
   log: string[];
   error?: string;

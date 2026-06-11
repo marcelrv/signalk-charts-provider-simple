@@ -230,20 +230,36 @@ describe('boxStatesForCatalog', () => {
     };
   }
 
-  it('up_to_date when baked editions still match current NOAA', () => {
-    const r = boxStatesForCatalog(builtCatalog(), indexWith('ED1', 'ED1'));
+  it('up_to_date when converted, present, and editions match current NOAA', () => {
+    const r = boxStatesForCatalog(builtCatalog(), indexWith('ED1', 'ED1'), true);
     assert.strictEqual(r['US4BOXA0'], 'up_to_date');
   });
 
   it('needs_refresh when a nested band-5 cell has a newer edition', () => {
-    const r = boxStatesForCatalog(builtCatalog(), indexWith('ED1', 'ED2'));
+    const r = boxStatesForCatalog(builtCatalog(), indexWith('ED1', 'ED2'), true);
     assert.strictEqual(r['US4BOXA0'], 'needs_refresh');
   });
 
   it('needs_refresh when the catalog was never built', () => {
     const r = boxStatesForCatalog(
-      { ...builtCatalog(), convertedChartPath: null },
-      indexWith('ED1', 'ED1')
+      { ...builtCatalog(), convertedChartPath: null, status: 'out_of_date' },
+      indexWith('ED1', 'ED1'),
+      false
+    );
+    assert.strictEqual(r['US4BOXA0'], 'needs_refresh');
+  });
+
+  it('needs_refresh when the output MBTiles is missing (e.g. after a cancel)', () => {
+    // Converted + editions match, but the file is gone — must not show green.
+    const r = boxStatesForCatalog(builtCatalog(), indexWith('ED1', 'ED1'), false);
+    assert.strictEqual(r['US4BOXA0'], 'needs_refresh');
+  });
+
+  it('needs_refresh when the status is no longer converted (cancelled/failed run)', () => {
+    const r = boxStatesForCatalog(
+      { ...builtCatalog(), status: 'out_of_date' },
+      indexWith('ED1', 'ED1'),
+      true
     );
     assert.strictEqual(r['US4BOXA0'], 'needs_refresh');
   });
@@ -254,14 +270,14 @@ describe('boxStatesForCatalog', () => {
       { encEdUp: 'US5NEST00_ED1', band: 5, ring: square(1, 1, 1) },
       { encEdUp: 'US5NEW000_ED1', band: 5, ring: square(2, 2, 1) } // new cell in the box
     ]);
-    const r = boxStatesForCatalog(builtCatalog(), idx);
+    const r = boxStatesForCatalog(builtCatalog(), idx, true);
     assert.strictEqual(r['US4BOXA0'], 'needs_refresh');
   });
 
-  // Edition-driven, so it does NOT depend on source files still being on disk
-  // (the chartFileExists check used by evaluateFreshness is irrelevant here).
-  it('is independent of on-disk source/output files', () => {
-    const r = boxStatesForCatalog(builtCatalog(), indexWith('ED1', 'ED1'));
+  // Edition-driven: doesn't depend on the downloaded source ZIPs (cleaned up
+  // after conversion), only on the built output existing.
+  it('is independent of the downloaded source ZIPs', () => {
+    const r = boxStatesForCatalog(builtCatalog(), indexWith('ED1', 'ED1'), true);
     assert.strictEqual(r['US4BOXA0'], 'up_to_date');
   });
 });

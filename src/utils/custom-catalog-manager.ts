@@ -369,22 +369,28 @@ export type BoxState = 'up_to_date' | 'needs_refresh';
  * the built MBTiles still matches the current NOAA editions for that box's
  * charts (its band-4 cell + the band-5 cells nested in it).
  *
- * `needs_refresh` when: the catalog was never built; a chart in the box's
- * current coverage has a newer `enc_ed_up` than the snapshot taken at build
- * time; or NOAA has added a new cell to the box since the build. `up_to_date`
- * only when every covered chart matches the baked snapshot.
+ * A box is `up_to_date` only when the chart set is cleanly converted, its
+ * MBTiles is present on disk, AND every covered chart matches the baked
+ * edition snapshot. It is `needs_refresh` otherwise — never built, a cancelled
+ * or failed build (status no longer `converted`), the output file missing, a
+ * drifted edition, or NOAA having added a new cell to the box.
  *
- * This is driven entirely by the edition snapshot persisted in the chart-set
- * JSON, so it is independent of whether the downloaded source ZIPs still exist
- * on disk (they are cleaned up after conversion by design).
+ * Edition-driven, so it doesn't depend on the downloaded *source* ZIPs still
+ * being on disk (those are cleaned up after conversion). It does require the
+ * built *output* MBTiles, since a missing chart genuinely needs a rebuild.
  */
 export function boxStatesForCatalog(
   catalog: CustomCatalog,
-  index: FootprintIndex
+  index: FootprintIndex,
+  mbtilesPresent: boolean
 ): Record<string, BoxState> {
   const coverage = coverageByBox(index.all, catalog.selectedBand4ChartIds);
   const baked = catalog.chartVersions;
-  const built = catalog.convertedChartPath !== null;
+  // `chartVersions` is also written at download time (before conversion), so on
+  // a cancelled/failed run it can claim current editions that aren't actually
+  // baked in. Gating on a clean 'converted' status + a present output file
+  // ensures those runs show red, not a false green.
+  const built = catalog.status === 'converted' && mbtilesPresent;
 
   const result: Record<string, BoxState> = {};
   for (const boxId of catalog.selectedBand4ChartIds) {
@@ -492,12 +498,26 @@ export function setCatalogDetail(id: string, detail: Partial<CustomCatalogProgre
 
 // ---- Cancellation ----
 
+// Per-run abort controller. The flow registers one at start; cancel aborts it
+// to kill the in-flight container job (signalk-container >= 1.16.0). The
+// cancelRequested flag remains the boundary-cancel signal and the way the flow
+// distinguishes a cancel from a genuine failure.
+const abortControllers = new Map<string, AbortController>();
+
+/** Register the run's abort controller so a cancel can fire its signal. */
+export function registerCatalogAbort(id: string, controller: AbortController): void {
+  abortControllers.set(id, controller);
+}
+
 /** Request cancellation of an in-flight run; no-op when not busy. */
 export function requestCatalogCancel(id: string): boolean {
   if (!busyCatalogs.has(id)) {
     return false;
   }
   cancelRequested.add(id);
+  // Kill the in-flight container job immediately where supported; the boundary
+  // check (isCatalogCancelRequested) covers older signalk-container.
+  abortControllers.get(id)?.abort();
   return true;
 }
 
@@ -507,4 +527,5 @@ export function isCatalogCancelRequested(id: string): boolean {
 
 export function clearCatalogCancel(id: string): void {
   cancelRequested.delete(id);
+  abortControllers.delete(id);
 }
