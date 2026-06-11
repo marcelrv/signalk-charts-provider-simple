@@ -13,10 +13,21 @@ import type {
   StatusCallback
 } from '../types.js';
 
-// Message thrown when an in-progress conversion is cancelled at a bucket
-// boundary. Callers (the Custom Catalogs flow) detect cancellation via their
-// own flag, so this is just a recognizable stop signal.
+// Message thrown when an in-progress conversion is cancelled — either at a
+// bucket boundary (isAborted) or mid-job when signalk-container kills the
+// container on abort and returns `status: 'cancelled'`. Callers (the Custom
+// Catalogs flow) detect cancellation via their own flag, so this is just a
+// recognizable stop signal.
 export const CONVERSION_ABORTED_MESSAGE = 'Conversion cancelled';
+
+// Stop the pipeline when a container job was killed by an abort signal
+// (signalk-container >= 1.16.0). Checked before the exit-code check, since a
+// killed job's exit code is meaningless.
+function throwIfJobCancelled(result: { status?: string }): void {
+  if (result.status === 'cancelled') {
+    throw new Error(CONVERSION_ABORTED_MESSAGE);
+  }
+}
 import { sanitizeChartFilename } from './catalog-title.js';
 import { getCpuBudget } from './concurrency.js';
 import { makeContainerWritable, makeContainerWritableDir } from './container-fs.js';
@@ -303,7 +314,8 @@ async function exportAllLayersToGeoJSON(
   encDir: string,
   encFiles: string[],
   geojsonDir: string,
-  chartNumber: string
+  chartNumber: string,
+  signal?: AbortSignal
 ): Promise<void> {
   const skipLayers = ['DSID', 'C_AGGR', 'C_ASSO', 'Generic'];
   const multiFile = encFiles.length > 1;
@@ -364,6 +376,7 @@ async function exportAllLayersToGeoJSON(
     // pass to xargs, so this just enforces the same ceiling at the
     // kernel cgroup level.
     resources: { cpus: parallelism },
+    signal,
     onStdoutLine: (line) => {
       appendLog(chartNumber, line);
       const match = line.match(/PROGRESS: Processing (\S+)/);
@@ -373,6 +386,8 @@ async function exportAllLayersToGeoJSON(
     },
     onStderrLine: (line) => appendLog(chartNumber, line)
   });
+
+  throwIfJobCancelled(result);
 
   if (result.exitCode !== 0) {
     // A structural export failure (find/ogrinfo/bash) may still have written
@@ -733,10 +748,12 @@ async function runTippecanoe(
     // scheduler still gives each worker its own core, so on a multi-
     // core box "half" budget feels indistinguishable from "all".
     resources: { cpus: tippecanoeThreads },
+    signal: options.signal,
     onStdoutLine: handleTippecanoeLine,
     onStderrLine: handleTippecanoeLine
   });
 
+  throwIfJobCancelled(result);
   if (result.exitCode !== 0) {
     throwJobFailure(result, 'tippecanoe', (t) => appendLog(chartNumber, t));
   }
@@ -764,7 +781,9 @@ async function runTippecanoe(
 async function runTileJoin(
   inputMbtiles: readonly string[],
   outputMbtiles: string,
-  chartNumber: string
+  chartNumber: string,
+  onPercent?: (pct: number) => void,
+  signal?: AbortSignal
 ): Promise<void> {
   if (inputMbtiles.length === 0) {
     throw new Error('runTileJoin called with no inputs');
@@ -776,6 +795,11 @@ async function runTileJoin(
     // place so the rest of the pipeline doesn't have to special-case.
     // Fall back to copy+unlink across filesystems (chartPath on a USB
     // mount is the realistic case where rename returns EXDEV).
+    // Honor cancellation here too, so this branch behaves like the
+    // multi-input path's post-job throwIfJobCancelled check.
+    if (signal?.aborted) {
+      throw new Error(CONVERSION_ABORTED_MESSAGE);
+    }
     try {
       fs.renameSync(inputMbtiles[0], outputMbtiles);
     } catch (err) {
@@ -785,6 +809,9 @@ async function runTileJoin(
       fs.copyFileSync(inputMbtiles[0], outputMbtiles);
       fs.unlinkSync(inputMbtiles[0]);
     }
+    // Mirror the multi-input path's completion so the "Combining" bar
+    // reaches 100% even when the join collapsed to a single file move.
+    onPercent?.(100);
     return;
   }
 
@@ -825,36 +852,86 @@ async function runTileJoin(
 
   appendLog(
     chartNumber,
-    `Joining ${inputMbtiles.length} per-band tile sets into ${path.basename(outputMbtiles)}...`
+    `Combining ${inputMbtiles.length} per-band tile sets into ${path.basename(outputMbtiles)}...`
   );
   debug(`Running tile-join on ${inputMbtiles.length} inputs`);
 
+  // tile-join gives us no usable streaming progress. Its only output is the
+  // current tile coordinate (`z/x/y`, no percentage), and it block-buffers
+  // that to stderr — flushing the entire ~30-line sample at process exit — so
+  // parsing stdout would leave the bar at 0% then snap to 100% at the very end
+  // (confirmed: a CPU-throttled join emits 0 bytes for its whole runtime, even
+  // under stdbuf or a PTY). Instead we watch the REAL signal: the output
+  // MBTiles grows on disk (a host-mounted path) as tiles are inserted, and its
+  // final size is ~the sum of the inputs (per-band intermediates have disjoint
+  // zoom ranges, so almost nothing dedupes). So currentSize / expectedSize
+  // tracks the merge smoothly and monotonically. Cap at 99%; snap to 100 once
+  // the job exits.
+  const expectedBytes = inputMbtiles.reduce((sum, f) => {
+    try {
+      return sum + fs.statSync(f).size;
+    } catch {
+      return sum;
+    }
+  }, 0);
+  let lastPct = 0;
+  const pollOutputSize = (): void => {
+    if (!onPercent || expectedBytes <= 0) {
+      return;
+    }
+    let size = 0;
+    try {
+      size = fs.statSync(outputMbtiles).size;
+    } catch {
+      return; // output not created yet
+    }
+    const pct = Math.min(99, Math.round((size / expectedBytes) * 100));
+    if (pct > lastPct) {
+      lastPct = pct;
+      onPercent(pct);
+    }
+  };
+  const sizeTimer = setInterval(pollOutputSize, 1000);
+
+  // tile-join's coordinate lines all arrive in one burst at exit; keep them out
+  // of the conversion log, but surface anything else (e.g. errors).
+  const tileLineRe = /^\s*\d+\/\d+\/\d+/;
   const handleTileJoinLine = (line: string): void => {
-    appendLog(chartNumber, line);
+    if (!tileLineRe.test(line)) {
+      appendLog(chartNumber, line);
+    }
   };
 
-  const result = await runContainerJob({
-    image: CHARTS_TOOLBOX_IMAGE,
-    label: `tile-join-${chartNumber}`,
-    command: [
-      'tile-join',
-      '-o',
-      `${outputPrefix}/${path.basename(outputMbtiles)}`,
-      '--no-tile-size-limit',
-      '--force',
-      ...inputArgs
-    ],
-    inputs: { '/input': resolved['/input'].source },
-    outputs: { '/output': resolved['/output'].source },
-    env: { TIPPECANOE_MAX_THREADS: String(tippecanoeThreads) },
-    resources: { cpus: tippecanoeThreads },
-    onStdoutLine: handleTileJoinLine,
-    onStderrLine: handleTileJoinLine
-  });
+  let result: Awaited<ReturnType<typeof runContainerJob>>;
+  try {
+    result = await runContainerJob({
+      image: CHARTS_TOOLBOX_IMAGE,
+      label: `tile-join-${chartNumber}`,
+      command: [
+        'tile-join',
+        '-o',
+        `${outputPrefix}/${path.basename(outputMbtiles)}`,
+        '--no-tile-size-limit',
+        '--force',
+        ...inputArgs
+      ],
+      inputs: { '/input': resolved['/input'].source },
+      outputs: { '/output': resolved['/output'].source },
+      env: { TIPPECANOE_MAX_THREADS: String(tippecanoeThreads) },
+      resources: { cpus: tippecanoeThreads },
+      signal,
+      onStdoutLine: handleTileJoinLine,
+      onStderrLine: handleTileJoinLine
+    });
+  } finally {
+    clearInterval(sizeTimer);
+  }
 
+  throwIfJobCancelled(result);
   if (result.exitCode !== 0) {
     throwJobFailure(result, 'tile-join', (t) => appendLog(chartNumber, t));
   }
+  onPercent?.(100);
 }
 
 /**
@@ -996,7 +1073,7 @@ async function runPerBandPipeline(
       `${bucketProgressPrefix} Exporting ${cells.length} cell(s) to GeoJSON...`
     );
     emitBucket('export', bucketLabel, -1);
-    await exportAllLayersToGeoJSON(bandEncDir, cells, bandGeojsonDir, chartNumber);
+    await exportAllLayersToGeoJSON(bandEncDir, cells, bandGeojsonDir, chartNumber, options.signal);
 
     setProgress(
       chartNumber,
@@ -1055,7 +1132,8 @@ async function runPerBandPipeline(
       unbandedEncDir,
       grouping.unbanded,
       unbandedGeojsonDir,
-      chartNumber
+      chartNumber,
+      options.signal
     );
 
     setProgress(
@@ -1086,15 +1164,17 @@ async function runPerBandPipeline(
   }
 
   abortIfRequested();
-  setProgress(chartNumber, 'converting', 'Joining per-band tile sets...');
-  options.onProgress?.({
-    stage: 'join',
-    bucketIndex: totalBuckets,
-    bucketCount: totalBuckets,
-    bucketLabel: 'Joining',
-    bucketPercent: -1
-  });
-  await runTileJoin(intermediates, outputMbtiles, chartNumber);
+  setProgress(chartNumber, 'converting', 'Combining per-band tile sets...');
+  const emitJoin = (bucketPercent: number): void =>
+    options.onProgress?.({
+      stage: 'join',
+      bucketIndex: totalBuckets,
+      bucketCount: totalBuckets,
+      bucketLabel: 'Combining',
+      bucketPercent
+    });
+  emitJoin(0);
+  await runTileJoin(intermediates, outputMbtiles, chartNumber, emitJoin, options.signal);
 }
 
 /**
@@ -1205,7 +1285,7 @@ export async function processS57Directory(
         bucketLabel: 'Charts',
         bucketPercent: -1
       });
-      await exportAllLayersToGeoJSON(encDir, encFiles, geojsonDir, chartNumber);
+      await exportAllLayersToGeoJSON(encDir, encFiles, geojsonDir, chartNumber, options.signal);
 
       statusFn('converting', 'Generating vector tiles...');
       setProgress(chartNumber, 'converting', 'Generating vector tiles with tippecanoe...');

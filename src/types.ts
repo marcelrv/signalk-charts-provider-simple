@@ -311,11 +311,16 @@ export interface S57ConversionOptions {
   onProgress?: (progress: S57BucketProgress) => void;
   /**
    * Optional cooperative-cancel check. Polled between buckets (and before
-   * tile-join); when it returns true the pipeline throws to stop at the next
-   * boundary. An in-flight container job can't be force-killed, so cancel
-   * takes effect at the next stage boundary, not instantly.
+   * tile-join) to stop the pipeline at the next boundary — a complement to
+   * `signal`, and the only cancel path on signalk-container < 1.16.0.
    */
   isAborted?: () => boolean;
+  /**
+   * Optional abort signal threaded into every container job. On
+   * signalk-container >= 1.16.0 this kills the in-flight job (GDAL,
+   * tippecanoe, or tile-join) immediately rather than waiting for a boundary.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ContainerRuntimeStatus {

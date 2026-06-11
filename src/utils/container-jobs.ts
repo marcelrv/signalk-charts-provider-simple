@@ -82,6 +82,12 @@ export interface JobRunOptions {
    * Available in signalk-container >= 1.4.0.
    */
   user?: { inImageUid?: number; inImageGid?: number } | false;
+  /**
+   * Abort the running container job. signalk-container >= 1.16.0 kills the
+   * container on abort and resolves with `status: 'cancelled'`; older
+   * versions ignore it (boundary cancel still applies).
+   */
+  signal?: AbortSignal;
 }
 
 export interface JobRunResult {
@@ -171,6 +177,7 @@ export async function runJob(opts: JobRunOptions): Promise<JobRunResult> {
     onStdoutLine: opts.onStdoutLine,
     onStderrLine: opts.onStderrLine,
     resources: opts.resources,
+    signal: opts.signal,
     // Required by signalk-container 1.3.0+ for cleanupOrphanedJobs to
     // find and reap our containers after a Signal K crash. Single
     // source of truth for the owner id; all of this plugin's helper

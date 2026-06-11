@@ -539,11 +539,9 @@ function renderProgress(): void {
   let cancelHtml = '';
   if (ccBusy && d?.phase === 'cancelling') {
     cancelHtml = `<span class="cc-cancel-pending">Cancelling…</span>`;
-  } else if (ccBusy && d?.phase === 'joining') {
-    // The tile-join container job can't be interrupted (signalk-container's
-    // runJob has no abort), so don't offer a Cancel that wouldn't work.
-    cancelHtml = `<span class="cc-cancel-pending">Can't be interrupted</span>`;
   } else if (ccBusy) {
+    // Every phase — including the combine — is now cancellable: the cancel
+    // route aborts the in-flight container job (signalk-container >= 1.16.0).
     cancelHtml = `<button class="cc-btn cc-btn-danger cc-cancel-btn" data-cc-action="cancel">Cancel</button>`;
   }
 
