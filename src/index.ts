@@ -3306,7 +3306,13 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
               let sectionLabel: string;
               let sectionPercent: number;
               if (p.stage === 'join') {
-                overall = denom > 0 ? Math.round(((p.bucketCount + pct / 100) / denom) * 100) : 99;
+                // Clamp: with a single bucket (no dedicated join slot) the
+                // join collapses to a file move and emits 100%, which would
+                // otherwise compute >100 here.
+                overall =
+                  denom > 0
+                    ? Math.min(100, Math.round(((p.bucketCount + pct / 100) / denom) * 100))
+                    : 99;
                 sectionLabel = `Combining ${p.bucketCount} tile sets`;
                 sectionPercent = p.bucketPercent;
               } else if (p.stage === 'export') {

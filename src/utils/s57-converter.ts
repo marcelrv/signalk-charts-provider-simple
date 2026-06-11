@@ -795,6 +795,11 @@ async function runTileJoin(
     // place so the rest of the pipeline doesn't have to special-case.
     // Fall back to copy+unlink across filesystems (chartPath on a USB
     // mount is the realistic case where rename returns EXDEV).
+    // Honor cancellation here too, so this branch behaves like the
+    // multi-input path's post-job throwIfJobCancelled check.
+    if (signal?.aborted) {
+      throw new Error(CONVERSION_ABORTED_MESSAGE);
+    }
     try {
       fs.renameSync(inputMbtiles[0], outputMbtiles);
     } catch (err) {
@@ -804,6 +809,9 @@ async function runTileJoin(
       fs.copyFileSync(inputMbtiles[0], outputMbtiles);
       fs.unlinkSync(inputMbtiles[0]);
     }
+    // Mirror the multi-input path's completion so the "Combining" bar
+    // reaches 100% even when the join collapsed to a single file move.
+    onPercent?.(100);
     return;
   }
 
