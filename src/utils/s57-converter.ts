@@ -592,34 +592,69 @@ function withTippecanoeMinzoom(feature: unknown, minzoom: number): unknown {
   return { ...f, tippecanoe: { ...existing, minzoom } };
 }
 
-// Build tippecanoe `-L NAME:FILE` args (the simple form). Per-layer minzoom
-// is *not* settable via `-L` JSON — tippecanoe silently ignores `minzoom`
-// fields there. Per-band minzoom is therefore stamped onto each feature in
-// the consolidator (see `consolidateGeoJSONByLayer`), and tippecanoe honors
-// `feature.tippecanoe.minzoom` natively. This function is just the
-// container-relative path stitching.
-//
-// `inputPrefix` defaults to `/input` for backwards compat with existing
-// tests; it changes to `/input/<subPath>` when SignalK is on a named
-// volume that covers a parent dir of the merged-GeoJSON scratch.
-function buildLayerArgs(
+// tippecanoe takes its layers as `-L NAME:FILE` pairs (the simple form).
+// Per-layer minzoom is *not* settable via `-L` — tippecanoe silently ignores
+// `minzoom` fields there. Per-band minzoom is therefore stamped onto each
+// feature in the consolidator (see `consolidateGeoJSONByLayer`), and tippecanoe
+// honors `feature.tippecanoe.minzoom` natively.
+
+// Basename for the per-job layer manifest, written into the mounted /input
+// dir alongside the consolidated GeoJSON.
+const TIPPECANOE_LAYER_MANIFEST = '.tippecanoe-layers';
+
+// One `layerName:/input/file.geojson` line per consolidated layer — the same
+// pairs `-L` would take, as a newline-delimited file the container reads.
+// `inputPrefix` defaults to `/input`; it changes to `/input/<subPath>` when
+// SignalK is on a named volume that covers a parent dir of the scratch.
+function buildLayerManifest(
   layers: readonly ConsolidatedLayer[],
   inputPrefix: string = '/input'
+): string {
+  return (
+    layers
+      .map(({ file }) => {
+        const rel = path.basename(file);
+        const layer = path.basename(rel, '.geojson');
+        return `${layer}:${inputPrefix}/${rel}`;
+      })
+      .join('\n') + '\n'
+  );
+}
+
+// Build the tippecanoe invocation as a small `bash -c` script that reads the
+// `-L` layer pairs from the manifest at runtime, instead of inlining them into
+// argv. A large bundle has 100+ layers, so inlining produced a 200+ element
+// container `Cmd` (a multi-KB createContainer body) that old podman's
+// docker-compat socket rejects with `write EPIPE` (issue #132). Reading them
+// from a file keeps argv at a constant 3 elements regardless of layer count —
+// the same shape the GDAL export step already uses successfully.
+function buildTippecanoeCommand(
+  fixedArgs: readonly string[],
+  manifestContainerPath: string
 ): string[] {
-  const args: string[] = [];
-  for (const { file } of layers) {
-    const rel = path.basename(file);
-    const layer = path.basename(rel, '.geojson');
-    args.push('-L', `${layer}:${inputPrefix}/${rel}`);
-  }
-  return args;
+  // Single-quote for the shell so paths/flags with spaces survive
+  // word-splitting (the manifest path can carry a named-volume subPath, and
+  // chart dirs commonly contain spaces).
+  const sq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+  const quoted = fixedArgs.map(sq).join(' ');
+  const script = [
+    'set -e',
+    'layers=()',
+    `while IFS= read -r line; do`,
+    '  [ -n "$line" ] && layers+=(-L "$line")',
+    `done < ${sq(manifestContainerPath)}`,
+    `exec tippecanoe ${quoted} "\${layers[@]}"`
+  ].join('\n');
+  return ['bash', '-c', script];
 }
 
 export const _testInternals = {
   consolidateGeoJSONByLayer,
   buildExportScript,
   bandClampedMaxzoom,
-  buildLayerArgs,
+  buildLayerManifest,
+  buildTippecanoeCommand,
+  TIPPECANOE_LAYER_MANIFEST,
   surfaceExportErrorsIfEmpty
 };
 
@@ -668,7 +703,13 @@ async function runTippecanoe(
   const outputPrefix = resolved['/output'].subPath
     ? `/output/${resolved['/output'].subPath}`
     : '/output';
-  const layerArgs = buildLayerArgs(mergedLayers, inputPrefix);
+  // Write the layer list into the mounted /input dir; tippecanoe reads it at
+  // runtime so the container Cmd stays small (see buildTippecanoeCommand).
+  fs.writeFileSync(
+    path.join(mergedDir, TIPPECANOE_LAYER_MANIFEST),
+    buildLayerManifest(mergedLayers, inputPrefix)
+  );
+  const manifestContainerPath = `${inputPrefix}/${TIPPECANOE_LAYER_MANIFEST}`;
 
   // Log per-band layer breakdown so users can see why low-zoom features differ
   // by band. Counts plus a sample of layer names — full lists would be noisy
@@ -697,7 +738,7 @@ async function runTippecanoe(
 
   const tippecanoeThreads = getCpuBudget().tippecanoeThreadsPerJob;
   debug(
-    `Running tippecanoe with ${layerArgs.length / 2} consolidated layers, zoom ${minzoom}-${maxzoom}, ${tippecanoeThreads} threads`
+    `Running tippecanoe with ${mergedLayers.length} consolidated layers, zoom ${minzoom}-${maxzoom}, ${tippecanoeThreads} threads`
   );
 
   const handleTippecanoeLine = (line: string): void => {
@@ -715,31 +756,32 @@ async function runTippecanoe(
   const result = await runContainerJob({
     image: CHARTS_TOOLBOX_IMAGE,
     label: `tippecanoe-${chartNumber}`,
-    command: [
-      'tippecanoe',
-      '-o',
-      `${outputPrefix}/${path.basename(outputMbtiles)}`,
-      '-z',
-      String(maxzoom),
-      '-Z',
-      String(minzoom),
-      '--no-tile-size-limit',
-      '--no-feature-limit',
-      '--detect-shared-borders',
-      // Preserve coastline detail end-to-end. Tippecanoe's defaults aggressively
-      // simplify and drop tiny polygons at high zooms, which destroys the
-      // coastline indentations that define marina basins, inland lagoons, and
-      // narrow harbour features. Empirically the basin-as-land issue some NOAA
-      // bundles exhibit at z16 (Michigan City Outer Basin, Lake Worth) goes
-      // away when these defaults are off — the basin coastline is in the
-      // source data, simplification was destroying it. Larger tile buffer
-      // (80, default 5) keeps polygon edges that hug a tile boundary intact.
-      '--no-simplification',
-      '--no-tiny-polygon-reduction',
-      '--buffer=80',
-      '--force',
-      ...layerArgs
-    ],
+    command: buildTippecanoeCommand(
+      [
+        '-o',
+        `${outputPrefix}/${path.basename(outputMbtiles)}`,
+        '-z',
+        String(maxzoom),
+        '-Z',
+        String(minzoom),
+        '--no-tile-size-limit',
+        '--no-feature-limit',
+        '--detect-shared-borders',
+        // Preserve coastline detail end-to-end. Tippecanoe's defaults aggressively
+        // simplify and drop tiny polygons at high zooms, which destroys the
+        // coastline indentations that define marina basins, inland lagoons, and
+        // narrow harbour features. Empirically the basin-as-land issue some NOAA
+        // bundles exhibit at z16 (Michigan City Outer Basin, Lake Worth) goes
+        // away when these defaults are off — the basin coastline is in the
+        // source data, simplification was destroying it. Larger tile buffer
+        // (80, default 5) keeps polygon edges that hug a tile boundary intact.
+        '--no-simplification',
+        '--no-tiny-polygon-reduction',
+        '--buffer=80',
+        '--force'
+      ],
+      manifestContainerPath
+    ),
     inputs: { '/input': resolved['/input'].source },
     outputs: { '/output': resolved['/output'].source },
     env: { TIPPECANOE_MAX_THREADS: String(tippecanoeThreads) },
