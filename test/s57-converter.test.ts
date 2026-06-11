@@ -15,7 +15,9 @@ const {
   consolidateGeoJSONByLayer,
   buildExportScript,
   bandClampedMaxzoom,
-  buildLayerArgs,
+  buildLayerManifest,
+  buildTippecanoeCommand,
+  TIPPECANOE_LAYER_MANIFEST,
   surfaceExportErrorsIfEmpty
 } = _testInternals;
 
@@ -432,35 +434,72 @@ describe('bandClampedMaxzoom (re-export from s57-converter._testInternals)', () 
   });
 });
 
-describe('buildLayerArgs (simple -L NAME:FILE form)', () => {
-  it('emits one -L LAYER:/input/LAYER.geojson pair per consolidated layer', () => {
+describe('buildLayerManifest (newline-delimited NAME:FILE form)', () => {
+  it('emits one LAYER:/input/LAYER.geojson line per consolidated layer', () => {
     const layers = [
       { file: '/some/host/path/HRBFAC.geojson', sourceFiles: ['HRBFAC_US5MA1SK.geojson'] },
       { file: '/some/host/path/LNDARE.geojson', sourceFiles: ['LNDARE_US3CO100.geojson'] }
     ];
-    const args = buildLayerArgs(layers);
-    assert.deepStrictEqual(args, [
-      '-L',
-      'HRBFAC:/input/HRBFAC.geojson',
-      '-L',
-      'LNDARE:/input/LNDARE.geojson'
-    ]);
+    assert.strictEqual(
+      buildLayerManifest(layers),
+      'HRBFAC:/input/HRBFAC.geojson\nLNDARE:/input/LNDARE.geojson\n'
+    );
   });
 
   it('uses the layer name from the merged file basename', () => {
     const layers = [{ file: '/anywhere/M_COVR.geojson', sourceFiles: ['M_COVR_US5MA1SK.geojson'] }];
-    assert.deepStrictEqual(buildLayerArgs(layers), ['-L', 'M_COVR:/input/M_COVR.geojson']);
+    assert.strictEqual(buildLayerManifest(layers), 'M_COVR:/input/M_COVR.geojson\n');
   });
 
   it('uses a custom inputPrefix for named-volume deployments', () => {
     // signalk-container resolves a named-volume mount: the whole volume is
     // mounted at /input and the consumer must navigate to the merged-GeoJSON
-    // dir via its subPath.  buildLayerArgs threads that into the -L args.
+    // dir via its subPath.  buildLayerManifest threads that into each line.
     const layers = [
       { file: '/some/host/path/HRBFAC.geojson', sourceFiles: ['HRBFAC_US5MA1SK.geojson'] }
     ];
-    const args = buildLayerArgs(layers, '/input/charts/scratch/.merged');
-    assert.deepStrictEqual(args, ['-L', 'HRBFAC:/input/charts/scratch/.merged/HRBFAC.geojson']);
+    assert.strictEqual(
+      buildLayerManifest(layers, '/input/charts/scratch/.merged'),
+      'HRBFAC:/input/charts/scratch/.merged/HRBFAC.geojson\n'
+    );
+  });
+});
+
+describe('buildTippecanoeCommand (argv stays small regardless of layer count)', () => {
+  it('returns a 3-element bash -c command that reads -L pairs from the manifest', () => {
+    const cmd = buildTippecanoeCommand(['-o', '/output/out.mbtiles', '-z', '14'], '/input/.layers');
+    assert.strictEqual(cmd.length, 3);
+    assert.strictEqual(cmd[0], 'bash');
+    assert.strictEqual(cmd[1], '-c');
+    // Reads the manifest (quoted), assembles -L args, execs tippecanoe.
+    assert.match(cmd[2], /< '\/input\/\.layers'/);
+    assert.match(cmd[2], /layers\+=\(-L "\$line"\)/);
+    assert.match(
+      cmd[2],
+      /exec tippecanoe '-o' '\/output\/out\.mbtiles' '-z' '14' "\$\{layers\[@\]\}"/
+    );
+  });
+
+  it('keeps argv length constant whether there are 2 or 200 layers', () => {
+    const small = buildTippecanoeCommand(['-o', '/output/out.mbtiles'], '/input/.layers');
+    // The manifest path is the only layer-derived input; the command is fixed.
+    assert.strictEqual(small.length, 3);
+  });
+
+  it('shell-quotes fixed args so paths with spaces survive', () => {
+    const cmd = buildTippecanoeCommand(['-o', '/out put/x.mbtiles'], '/input/.layers');
+    assert.match(cmd[2], /'\/out put\/x\.mbtiles'/);
+  });
+
+  it('quotes the manifest path so a named-volume subPath with spaces works', () => {
+    const cmd = buildTippecanoeCommand(['-o', '/output/out.mbtiles'], '/input/My Charts/.layers');
+    assert.match(cmd[2], /done < '\/input\/My Charts\/\.layers'/);
+  });
+
+  it('exports TIPPECANOE_LAYER_MANIFEST', () => {
+    assert.ok(
+      typeof TIPPECANOE_LAYER_MANIFEST === 'string' && TIPPECANOE_LAYER_MANIFEST.length > 0
+    );
   });
 });
 
