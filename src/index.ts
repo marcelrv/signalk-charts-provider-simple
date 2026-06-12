@@ -39,7 +39,7 @@ import { scanAllFolders, scanChartsRecursively } from './utils/file-scanner.js';
 import { repairMbtilesMetadata, setMbtilesDisplayName } from './utils/mbtiles-metadata.js';
 import { open as openMbtilesReader } from './utils/mbtiles-reader.js';
 import { writeChartPathMarker } from './utils/path-marker.js';
-import { getOverzoomedTile } from './utils/tile-overzoom.js';
+import { getBlankTileReplacement, getOverzoomedTile } from './utils/tile-overzoom.js';
 import { arePairWithinBase, isWithinBase, validateChartName } from './utils/path-safety.js';
 import { parsePluginConfig } from './utils/plugin-config-schema.js';
 import {
@@ -3641,7 +3641,9 @@ const serveTileFromFilesystem = (
   });
 };
 
-const serveTileFromMbtiles = (
+// Exported for tests (the Express route registration is not separately
+// constructible without a full server).
+export const serveTileFromMbtiles = (
   res: Response,
   provider: ChartProvider,
   z: number,
@@ -3670,6 +3672,21 @@ const serveTileFromMbtiles = (
       }
       res.sendStatus(404);
     } else {
+      // A stored cell-edge tile whose features all sit outside its visible
+      // extent renders blank and would mask lower-band content; serve a
+      // synthesized replacement instead.
+      if (provider.format === 'pbf' && provider._mbtilesHandle) {
+        const replacement = getBlankTileReplacement(provider._mbtilesHandle, z, x, y, result.data);
+        if (replacement) {
+          res.writeHead(200, {
+            'Content-Type': 'application/x-protobuf',
+            'Content-Encoding': 'gzip',
+            'Cache-Control': responseHttpOptions.headers['Cache-Control']
+          });
+          res.end(replacement);
+          return;
+        }
+      }
       const headers = {
         ...result.headers,
         'Cache-Control': responseHttpOptions.headers['Cache-Control']
