@@ -34,5 +34,6 @@ cr-review*
 # samples
 samples/
 
-# Generated test fixture — rebuilt by pretest via test/fixtures/create-test-mbtiles.js
+# Generated test fixtures — rebuilt by pretest via test/fixtures/create-test-*.cjs
 test/fixtures/test-chart.mbtiles
+test/fixtures/test-vector-chart.mbtiles

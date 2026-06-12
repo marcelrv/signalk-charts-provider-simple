@@ -39,6 +39,7 @@ import { scanAllFolders, scanChartsRecursively } from './utils/file-scanner.js';
 import { repairMbtilesMetadata, setMbtilesDisplayName } from './utils/mbtiles-metadata.js';
 import { open as openMbtilesReader } from './utils/mbtiles-reader.js';
 import { writeChartPathMarker } from './utils/path-marker.js';
+import { getOverzoomedTile } from './utils/tile-overzoom.js';
 import { arePairWithinBase, isWithinBase, validateChartName } from './utils/path-safety.js';
 import { parsePluginConfig } from './utils/plugin-config-schema.js';
 import {
@@ -3651,6 +3652,22 @@ const serveTileFromMbtiles = (
     const result = provider._mbtilesHandle?.getTile(z, x, y) ?? null;
 
     if (!result) {
+      // Combined NOAA chart sets have spatially varying max zoom (per-band
+      // bounds + zoom ranges merged by tile-join), so clients legitimately
+      // request tiles in coverage holes the advertised zoom range implies
+      // should exist. Re-slice the nearest ancestor instead of 404ing black.
+      if (provider.format === 'pbf' && provider._mbtilesHandle) {
+        const synthesized = getOverzoomedTile(provider._mbtilesHandle, z, x, y);
+        if (synthesized) {
+          res.writeHead(200, {
+            'Content-Type': 'application/x-protobuf',
+            'Content-Encoding': 'gzip',
+            'Cache-Control': responseHttpOptions.headers['Cache-Control']
+          });
+          res.end(synthesized);
+          return;
+        }
+      }
       res.sendStatus(404);
     } else {
       const headers = {

@@ -157,6 +157,19 @@ describe('MBTilesReader', () => {
     });
   });
 
+  describe('getRawTile()', () => {
+    it('returns the same bytes getTile() serves', () => {
+      const raw = reader.getRawTile(0, 0, 0);
+      const served = reader.getTile(0, 0, 0);
+      assert.ok(raw && served);
+      assert.deepStrictEqual(raw, served.data);
+    });
+
+    it('returns null for non-existing tile', () => {
+      assert.strictEqual(reader.getRawTile(10, 999, 999), null);
+    });
+  });
+
   describe('close()', () => {
     it('should close database without error', () => {
       const tempReader = new MBTilesReader(TEST_MBTILES);

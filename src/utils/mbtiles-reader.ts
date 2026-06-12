@@ -124,7 +124,8 @@ export class MBTilesReader {
     return metadata;
   }
 
-  getTile(z: number, x: number, y: number): TileResult | null {
+  /** Raw tile blob for XYZ coordinates (TMS flip applied), without HTTP headers. */
+  getRawTile(z: number, x: number, y: number): Buffer | null {
     if (!this.db) {
       throw new Error('Database is closed');
     }
@@ -150,7 +151,16 @@ export class MBTilesReader {
     // not. For a 200KB pbf tile that's 200KB of malloc+memcpy avoided
     // per request — material at Freeboard pan/zoom rates.
     const u = row.tile_data;
-    const data = Buffer.from(u.buffer, u.byteOffset, u.byteLength);
+    return Buffer.from(u.buffer, u.byteOffset, u.byteLength);
+  }
+
+  getTile(z: number, x: number, y: number): TileResult | null {
+    const data = this.getRawTile(z, x, y);
+
+    if (!data) {
+      return null;
+    }
+
     const metadata = this.getInfo();
     const format = metadata.format ?? 'png';
 
