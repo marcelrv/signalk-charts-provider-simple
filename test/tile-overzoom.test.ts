@@ -2,11 +2,13 @@
  * Tests for serve-time overzoom synthesis from vector MBTiles.
  *
  * The fixture (create-test-vector-mbtiles.cjs) advertises minzoom=2,
- * maxzoom=16 but contains only four tiles: z2 (0,1) with 'test-buoy' (id 42)
- * + an `areas` polygon, z3 (0,3) with 'z3-buoy' (id 43) at the same lon/lat,
- * z8 (56,86) with 'z8-buoy' (id 88) far away, and a corrupt-gzip z2 (1,1).
- * That reproduces the pyramid holes of a combined NOAA chart set: deep
- * requests inside coverage must synthesize from the NEAREST ancestor,
+ * maxzoom=16 but contains only six tiles — see the generator's header for
+ * the authoritative inventory: z2 (0,1) 'test-buoy' (id 42) + `areas`
+ * polygon, z3 (0,3) 'z3-buoy' (id 43) at the same lon/lat, z8 (56,86)
+ * 'z8-buoy' (id 88) far away, corrupt-gzip z2 (1,1), buffer-only z4 (0,7)
+ * and z4 (3,5). That reproduces the pyramid
+ * holes and cell-edge artifacts of a combined NOAA chart set: deep requests
+ * inside coverage must synthesize from the NEAREST content-bearing ancestor,
  * requests outside coverage must keep returning null (→ 404).
  */
 
@@ -14,18 +16,21 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, gzipSync } from 'node:zlib';
 
 import Pbf from 'pbf';
 import { VectorTile } from '@mapbox/vector-tile';
+import { fromGeojsonVt } from 'vt-pbf';
 import type { Feature, Point } from 'geojson';
 
 import { MBTilesReader } from '../dist/utils/mbtiles-reader.js';
 import {
+  getBlankTileReplacement,
   getOverzoomedTile,
   MAX_OVERZOOM_DELTA,
   _overzoomCacheStats
 } from '../dist/utils/tile-overzoom.js';
+import { serveTileFromMbtiles } from '../dist/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -187,23 +192,190 @@ describe('getOverzoomedTile()', () => {
         'a different ancestor is read once, the z2 index is not re-read'
       );
 
-      assert.strictEqual(getOverzoomedTile(fresh, 4, 0, 6), null, 'empty quadrant of z3');
-      assert.strictEqual(
-        rawCalls.length,
-        2,
-        'empty quadrant slices from the cached index without raw reads'
+      // (4,2,6) is empty at every ancestor; the walk probes the missing z3
+      // (1,3) once, then slices the already-cached z2 index without reading.
+      assert.strictEqual(getOverzoomedTile(fresh, 4, 2, 6), null, 'empty quadrant');
+      assert.deepStrictEqual(
+        rawCalls,
+        [
+          [2, 0, 1],
+          [3, 0, 3],
+          [3, 1, 3]
+        ],
+        'cached ancestor indexes are sliced without raw re-reads'
       );
 
       const stats = _overzoomCacheStats(fresh);
       assert.strictEqual(stats.indexes, 2, 'both ancestor indexes cached');
       assert.strictEqual(stats.tiles, 3, 'two tiles plus one null cached');
 
-      assert.strictEqual(getOverzoomedTile(fresh, 4, 0, 6), null);
-      assert.strictEqual(rawCalls.length, 2, 'null results are cached too');
+      assert.strictEqual(getOverzoomedTile(fresh, 4, 2, 6), null);
+      assert.strictEqual(rawCalls.length, 3, 'null results are cached too');
       assert.deepStrictEqual(_overzoomCacheStats(fresh), stats);
     } finally {
       fresh.close();
     }
+  });
+
+  it('walks past buffer-only ancestors to deeper coverage', () => {
+    // z5 (1,14) is missing; its nearest ancestor z4 (0,7) is the stored
+    // buffer-only tile (nothing visible). The walk must continue to z3.
+    const tile = getOverzoomedTile(reader, 5, 1, 14);
+    assert.ok(tile, 'must synthesize from z3 despite the blank z4 ancestor');
+    const vt = decode(tile);
+    assert.strictEqual(vt.layers.points.feature(0).properties.name, 'z3-buoy');
+    assert.strictEqual(vt.layers.ghost, undefined);
+  });
+
+  describe('getBlankTileReplacement()', () => {
+    it('replaces a stored buffer-only tile with synthesized content', () => {
+      const raw = reader.getRawTile(4, 0, 7);
+      assert.ok(raw, 'fixture must store the buffer-only tile');
+      assert.ok(decode(raw).layers.ghost, 'stored tile holds only the ghost layer');
+
+      const replacement = getBlankTileReplacement(reader, 4, 0, 7, raw);
+      assert.ok(replacement, 'blank stored tile must be replaced');
+      const vt = decode(replacement);
+      assert.strictEqual(vt.layers.points.feature(0).properties.name, 'z3-buoy');
+      assert.strictEqual(vt.layers.ghost, undefined, 'invisible buffer content is not merged');
+    });
+
+    it('keeps the stored tile when the blank quadrant has nothing to synthesize', () => {
+      const raw = reader.getRawTile(4, 3, 5);
+      assert.ok(raw);
+      assert.strictEqual(getBlankTileReplacement(reader, 4, 3, 5, raw), null);
+    });
+
+    it('leaves stored tiles with visible features untouched', () => {
+      const raw = reader.getRawTile(2, 0, 1);
+      assert.ok(raw);
+      assert.strictEqual(getBlankTileReplacement(reader, 2, 0, 1, raw), null);
+    });
+
+    it('never replaces a stored tile whose feature straddles the tile edge', () => {
+      // Simulate the stored (4,0,7) tile holding a feature whose bbox is
+      // x1 < 0 < x2 — partially visible. That quadrant WOULD synthesize
+      // ('z3-buoy'), so misclassifying straddlers as blank fails loudly.
+      const straddleRaw = gzipSync(
+        Buffer.from(
+          fromGeojsonVt(
+            {
+              ghost: {
+                features: [
+                  {
+                    id: 1,
+                    type: 3,
+                    geometry: [
+                      [
+                        [-100, 200],
+                        [500, 200],
+                        [500, 800],
+                        [-100, 800],
+                        [-100, 200]
+                      ]
+                    ],
+                    tags: { kind: 'straddle' }
+                  }
+                ]
+              }
+            },
+            { version: 2 }
+          )
+        )
+      );
+      const fresh = new MBTilesReader(VECTOR_MBTILES);
+      try {
+        assert.strictEqual(getBlankTileReplacement(fresh, 4, 0, 7, straddleRaw), null);
+      } finally {
+        fresh.close();
+      }
+    });
+
+    it('skips the blank check entirely for oversized stored tiles', () => {
+      // (4,0,7) WOULD synthesize if the check ran (an all-zero buffer parses
+      // as zero layers = blank), so the size cap is pinned by asserting no
+      // synthesis happens.
+      const fresh = new MBTilesReader(VECTOR_MBTILES);
+      try {
+        const rawCalls: Array<[number, number, number]> = [];
+        const realGetRawTile = fresh.getRawTile.bind(fresh);
+        fresh.getRawTile = (z: number, x: number, y: number) => {
+          rawCalls.push([z, x, y]);
+          return realGetRawTile(z, x, y);
+        };
+        assert.strictEqual(getBlankTileReplacement(fresh, 4, 0, 7, Buffer.alloc(40000)), null);
+        assert.strictEqual(rawCalls.length, 0, 'no synthesis attempted beyond the size cap');
+      } finally {
+        fresh.close();
+      }
+    });
+
+    it('degrades to the stored tile on corrupt data and caches that verdict', () => {
+      const fresh = new MBTilesReader(VECTOR_MBTILES);
+      try {
+        const corrupt = fresh.getRawTile(2, 1, 1);
+        assert.ok(corrupt);
+        let result: Buffer | null = null;
+        assert.doesNotThrow(() => {
+          result = getBlankTileReplacement(fresh, 2, 1, 1, corrupt);
+        });
+        assert.strictEqual(result, null);
+        assert.strictEqual(
+          _overzoomCacheStats(fresh).replacements,
+          1,
+          'stored bytes are immutable per reader — the error verdict must be cached'
+        );
+      } finally {
+        fresh.close();
+      }
+    });
+
+    it('caches "serve stored" verdicts for visible tiles', () => {
+      const fresh = new MBTilesReader(VECTOR_MBTILES);
+      try {
+        const raw = fresh.getRawTile(2, 0, 1);
+        assert.ok(raw);
+        assert.strictEqual(getBlankTileReplacement(fresh, 2, 0, 1, raw), null);
+        assert.strictEqual(_overzoomCacheStats(fresh).replacements, 1);
+      } finally {
+        fresh.close();
+      }
+    });
+
+    it('caches replacement verdicts per tile', () => {
+      const fresh = new MBTilesReader(VECTOR_MBTILES);
+      try {
+        const raw = fresh.getRawTile(4, 0, 7);
+        assert.ok(raw);
+        const rawCalls: Array<[number, number, number]> = [];
+        const realGetRawTile = fresh.getRawTile.bind(fresh);
+        fresh.getRawTile = (z: number, x: number, y: number) => {
+          rawCalls.push([z, x, y]);
+          return realGetRawTile(z, x, y);
+        };
+
+        const first = getBlankTileReplacement(fresh, 4, 0, 7, raw);
+        assert.ok(first);
+        assert.deepStrictEqual(rawCalls, [[3, 0, 3]], 'synthesis reads the ancestor once');
+
+        const second = getBlankTileReplacement(fresh, 4, 0, 7, raw);
+        assert.strictEqual(second, first, 'repeat returns the cached Buffer instance');
+        assert.strictEqual(rawCalls.length, 1, 'verdict cache avoids re-checking');
+        assert.ok(_overzoomCacheStats(fresh).replacements >= 1);
+
+        // The verdict is keyed by coordinates, not content: a cached hit
+        // must return without decoding (garbage would throw → null if the
+        // cache lookup were broken).
+        const garbage = Buffer.from([0x1f, 0x8b, 0x00, 0x01, 0x02]);
+        assert.strictEqual(
+          getBlankTileReplacement(fresh, 4, 0, 7, garbage),
+          first,
+          'cache hit must short-circuit before any decode'
+        );
+      } finally {
+        fresh.close();
+      }
+    });
   });
 
   it('returns null for raster charts (overzoom is pbf-only)', () => {
@@ -214,5 +386,71 @@ describe('getOverzoomedTile()', () => {
     } finally {
       raster.close();
     }
+  });
+
+  describe('serveTileFromMbtiles() route handler', () => {
+    type ServeArgs = Parameters<typeof serveTileFromMbtiles>;
+
+    function fakeRes() {
+      const res = {
+        statusCode: 0,
+        headers: {} as Record<string, string>,
+        body: undefined as unknown,
+        writeHead(code: number, headers: Record<string, string>) {
+          res.statusCode = code;
+          res.headers = headers;
+          return res;
+        },
+        end(data?: unknown) {
+          res.body = data;
+        },
+        sendStatus(code: number) {
+          res.statusCode = code;
+        }
+      };
+      return res;
+    }
+
+    const asProvider = (r: MBTilesReader): ServeArgs[1] =>
+      ({ identifier: 'test', format: 'pbf', _mbtilesHandle: r }) as unknown as ServeArgs[1];
+
+    it('serves synthesized tiles for coverage holes with pbf+gzip headers', () => {
+      // z5 (1,14) is missing; synthesis walks past the blank z4 ghost to z3.
+      const res = fakeRes();
+      serveTileFromMbtiles(res as unknown as ServeArgs[0], asProvider(reader), 5, 1, 14);
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(res.headers['Content-Type'], 'application/x-protobuf');
+      assert.strictEqual(res.headers['Content-Encoding'], 'gzip');
+      assert.ok(res.headers['Cache-Control'], 'cache header must be present');
+      const vt = decode(res.body as Buffer);
+      assert.strictEqual(vt.layers.points.feature(0).properties.name, 'z3-buoy');
+    });
+
+    it('serves the replacement for stored blank tiles', () => {
+      const res = fakeRes();
+      serveTileFromMbtiles(res as unknown as ServeArgs[0], asProvider(reader), 4, 0, 7);
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(res.headers['Content-Type'], 'application/x-protobuf');
+      assert.strictEqual(res.headers['Content-Encoding'], 'gzip');
+      const vt = decode(res.body as Buffer);
+      assert.strictEqual(vt.layers.points.feature(0).properties.name, 'z3-buoy');
+      assert.strictEqual(vt.layers.ghost, undefined, 'must not serve the stored ghost bytes');
+    });
+
+    it('serves stored tiles with visible content unchanged', () => {
+      const res = fakeRes();
+      serveTileFromMbtiles(res as unknown as ServeArgs[0], asProvider(reader), 2, 0, 1);
+      assert.strictEqual(res.statusCode, 200);
+      const stored = reader.getTile(2, 0, 1);
+      assert.ok(stored);
+      assert.deepStrictEqual(res.body, stored.data, 'stored bytes must pass through untouched');
+      assert.strictEqual(res.headers['Content-Type'], 'application/x-protobuf');
+    });
+
+    it('keeps 404 outside coverage', () => {
+      const res = fakeRes();
+      serveTileFromMbtiles(res as unknown as ServeArgs[0], asProvider(reader), 3, 7, 7);
+      assert.strictEqual(res.statusCode, 404);
+    });
   });
 });

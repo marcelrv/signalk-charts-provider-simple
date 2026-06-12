@@ -7,6 +7,6 @@
     "declarationMap": false,
     "noEmit": false
   },
-  "include": ["test/**/*.ts"],
+  "include": ["test/**/*.ts", "src/types/vt-pbf.d.ts"],
   "exclude": ["node_modules", "dist", "dist-test"]
 }

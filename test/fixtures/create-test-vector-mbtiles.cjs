@@ -1,7 +1,7 @@
 /**
  * Script to create a minimal vector (pbf) test MBTiles file for the
  * tile-overzoom tests. The pyramid intentionally has holes: metadata
- * advertises minzoom=2..maxzoom=16 but only four tiles exist — the same
+ * advertises minzoom=2..maxzoom=16 but only six tiles exist — the same
  * shape as a combined NOAA chart set where deep zooms are missing in areas
  * covered only by a low band.
  *
@@ -13,6 +13,14 @@
  *                  maxZoom option, whose default 14 would return null)
  *   z2 XYZ (1,1)   corrupt gzip bytes — synthesis from it must degrade to
  *                  null, never throw
+ *   z4 XYZ (0,7)   STORED "buffer-only" tile: four features, each outside
+ *                  the visible extent past a different edge (x > extent,
+ *                  y > extent, x < 0, y < 0), like tippecanoe cell-edge
+ *                  tiles carrying just the neighbor's buffer spill — must be
+ *                  REPLACED by synthesis from z3, which pins every arm of
+ *                  the visibility predicate
+ *   z4 XYZ (3,5)   buffer-only, and its quadrant is empty in every
+ *                  ancestor — stored tile must be served as-is
  *
  * Tile contents are independent per tile (no real pyramid consistency); the
  * overzoom module only ever reads one ancestor at a time, so that's fine.
@@ -130,6 +138,50 @@ insertXyz(3, 0, 3, makeTile({ points: pointFc(43, 'z3-buoy', POINT_LON, POINT_LA
 insertXyz(8, 56, 86, makeTile({ points: pointFc(88, 'z8-buoy', DEEP_LON, DEEP_LAT) }, 8, 56, 86));
 // Corrupt tile: valid gzip magic, garbage body.
 insertXyz(2, 1, 1, Buffer.from([0x1f, 0x8b, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x02, 0x03]));
+
+// Hand-built MVTs in raw extent units (no geojson-vt involved).
+function ghostTile(rings) {
+  const mvt = vtpbf.fromGeojsonVt(
+    {
+      ghost: {
+        features: rings.map((ring, i) => ({
+          id: 99 + i,
+          type: 3,
+          geometry: [ring],
+          tags: { kind: 'neighbor-spill' }
+        }))
+      }
+    },
+    { version: 2 }
+  );
+  return gzipSync(Buffer.from(mvt));
+}
+
+const square = (x1, y1, x2, y2) => [
+  [x1, y1],
+  [x2, y1],
+  [x2, y2],
+  [x1, y2],
+  [x1, y1]
+];
+
+// Buffer-only: every feature entirely outside the 0..4096 extent, so the
+// tile renders nothing. (0,7) carries one feature per visibility-predicate
+// arm: right (x1 > extent), bottom (y1 > extent), left (x2 < 0), top
+// (y2 < 0) — losing any arm makes that feature "visible" and the tile
+// non-blank.
+insertXyz(
+  4,
+  0,
+  7,
+  ghostTile([
+    square(4500, 100, 5000, 600),
+    square(100, 4500, 600, 5000),
+    square(-500, 100, -100, 600),
+    square(100, -500, 600, -100)
+  ])
+);
+insertXyz(4, 3, 5, ghostTile([square(-500, 100, -100, 600)]));
 
 db.close();
 
