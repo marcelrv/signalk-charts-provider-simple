@@ -116,7 +116,11 @@ describe('validateChartName', () => {
 });
 
 describe('resolveDefaultChartsPath', () => {
-  const fallback = '/home/node/.signalk/charts-simple';
+  // Synthetic paths only — the values are arbitrary for these pure tests, and
+  // a literal `/home/<user>/` would trip the SignalK plugin-CI "hardcoded home
+  // directory path" scan.
+  const fallback = '/srv/sk-data/charts-simple';
+  const hostMount = '/srv/charts-host';
 
   it('uses the in-data-volume default when the host-mount env is unset', () => {
     assert.strictEqual(resolveDefaultChartsPath(undefined, fallback), fallback);
@@ -131,17 +135,11 @@ describe('resolveDefaultChartsPath', () => {
   });
 
   it('prefers the host-mount env when it is a non-empty path', () => {
-    assert.strictEqual(
-      resolveDefaultChartsPath('/home/node/charts-host', fallback),
-      '/home/node/charts-host'
-    );
+    assert.strictEqual(resolveDefaultChartsPath(hostMount, fallback), hostMount);
   });
 
   it('trims surrounding whitespace from the host-mount env', () => {
-    assert.strictEqual(
-      resolveDefaultChartsPath('  /home/node/charts-host  ', fallback),
-      '/home/node/charts-host'
-    );
+    assert.strictEqual(resolveDefaultChartsPath(`  ${hostMount}  `, fallback), hostMount);
   });
 });
 
@@ -153,7 +151,7 @@ describe('hasHostChartsMountEnv', () => {
   });
 
   it('is true for a non-empty path', () => {
-    assert.strictEqual(hasHostChartsMountEnv('/home/node/charts-host'), true);
+    assert.strictEqual(hasHostChartsMountEnv('/srv/charts-host'), true);
     assert.strictEqual(hasHostChartsMountEnv('  /x  '), true);
   });
 });

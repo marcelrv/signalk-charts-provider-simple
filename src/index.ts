@@ -332,11 +332,16 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
     const access = classifyChartDirAccess(isHostMount, exists, createdOrWritable);
     if (!access.ok) {
       if (access.reason === 'mount-missing') {
+        // NB: clearing the Chart path setting does NOT help here — with
+        // SIGNALK_CHARTS_HOST_PATH still set, the default resolves right back to
+        // this same (missing) mount. The real fixes are restoring the mount or
+        // removing the installer env / pointing at a reachable in-container dir.
         app.setPluginError(
           `Shared charts folder is not mounted into the container at ${chartPath}. ` +
             `Charts live in a host folder the installer shares with the container; that ` +
-            `mount appears to be missing. Re-run the installer to restore it, or clear the ` +
-            `Chart path setting to fall back to Signal K's own charts folder.`
+            `mount appears to be missing. Re-run the installer to restore it, remove the ` +
+            `installer-provided SIGNALK_CHARTS_HOST_PATH setting, or set Chart path to a ` +
+            `directory that is reachable inside the container.`
         );
       } else if (access.reason === 'exists-unwritable') {
         app.setPluginError(
@@ -3654,13 +3659,19 @@ const ensureDirectoryExists = (dirPath: string): boolean => {
   }
 };
 
-// Probe whether an EXISTING directory is writable, without creating it. Used
-// for the injected host charts mount: we must NOT mkdir a missing mount (that
-// silently shadows it with an ephemeral in-container dir), so we check
-// existence + writability separately instead of create-on-demand.
+// Probe whether an EXISTING directory is usable as a chart root, without
+// creating it. Used for the injected host charts mount: we must NOT mkdir a
+// missing mount (that silently shadows it with an ephemeral in-container dir),
+// so we check existence + usability separately instead of create-on-demand.
+// Requires an actual directory (W_OK alone would accept a writable regular
+// file) with both write AND execute/search permission (X_OK — needed to
+// traverse into it to read/write chart files).
 const isDirWritable = (dirPath: string): boolean => {
   try {
-    fs.accessSync(dirPath, fs.constants.W_OK);
+    if (!fs.statSync(dirPath).isDirectory()) {
+      return false;
+    }
+    fs.accessSync(dirPath, fs.constants.W_OK | fs.constants.X_OK);
     return true;
   } catch {
     return false;
