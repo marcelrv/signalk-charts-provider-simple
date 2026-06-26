@@ -324,9 +324,13 @@ const pluginConstructor = (app: ExtendedServerAPI): Plugin => {
       exists = fs.existsSync(chartPath);
       createdOrWritable = exists && isDirWritable(chartPath);
     } else {
-      // In-data-volume default or a user-typed path: create-on-demand as before.
-      createdOrWritable = ensureDirectoryExists(chartPath);
-      exists = createdOrWritable || fs.existsSync(chartPath);
+      // In-data-volume default or a user-typed path: create-on-demand, then
+      // verify it is an actually-writable directory. ensureDirectoryExists
+      // returns true for any path that already exists, so without the
+      // isDirWritable probe an existing read-only dir (or a regular file at
+      // that path) would slip through as usable and only fail on first write.
+      createdOrWritable = ensureDirectoryExists(chartPath) && isDirWritable(chartPath);
+      exists = fs.existsSync(chartPath);
     }
 
     const access = classifyChartDirAccess(isHostMount, exists, createdOrWritable);
