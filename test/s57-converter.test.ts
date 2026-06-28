@@ -593,8 +593,7 @@ describe('stampMbtilesName (degenerate single-input tile-join path)', () => {
   function readName(file: string): string | null {
     const db = new DatabaseSync(file);
     const row = db.prepare("SELECT value FROM metadata WHERE name = 'name'").get() as
-      | { value: string }
-      | undefined;
+      { value: string } | undefined;
     db.close();
     return row ? row.value : null;
   }
