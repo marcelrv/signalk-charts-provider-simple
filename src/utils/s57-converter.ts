@@ -165,16 +165,30 @@ function wantedMbtilesName(chartNumber: string, displayName: string | undefined)
  * tile-join single-input degenerate path, where no container job runs to bake
  * the name in via `-n`. DELETE-then-INSERT (not INSERT OR REPLACE) because
  * tippecanoe's `metadata` table has no UNIQUE constraint on `name`, so REPLACE
- * would append a second row rather than overwrite. Never throws — the
- * post-conversion patch is the authoritative pass.
+ * would append a second row rather than overwrite. The DELETE + INSERT run in
+ * a transaction so a throwing INSERT can't leave the file with the old `name`
+ * deleted and no replacement (mirrors setMbtilesDisplayName). Never throws —
+ * the post-conversion patch is the authoritative pass.
  */
 function stampMbtilesName(outputPath: string, name: string): void {
   try {
     const db = new DatabaseSync(outputPath);
+    let inTransaction = false;
     try {
+      db.exec('BEGIN TRANSACTION');
+      inTransaction = true;
       db.exec("DELETE FROM metadata WHERE name = 'name'");
       db.prepare("INSERT INTO metadata (name, value) VALUES ('name', ?)").run(name);
+      db.exec('COMMIT');
+      inTransaction = false;
     } finally {
+      if (inTransaction) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          /* already closed / rolled back */
+        }
+      }
       db.close();
     }
   } catch {
