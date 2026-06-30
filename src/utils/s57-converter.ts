@@ -66,13 +66,19 @@ export function getAllConversionProgress(): ConversionProgressMap {
 }
 
 export function setConversionFailed(chartNumber: string, message: string): void {
-  conversionProgress[chartNumber] = {
+  const entry: ConversionProgress = {
     status: 'failed',
     message,
     log: conversionProgress[chartNumber]?.log ?? []
   };
+  conversionProgress[chartNumber] = entry;
+  // Only clear the entry if it's still the one this timer was scheduled for
+  // — a retry started in the meantime replaces it with a new object (and
+  // schedules its own cleanup), so a stale timer must not delete that one.
   setTimeout(() => {
-    delete conversionProgress[chartNumber];
+    if (conversionProgress[chartNumber] === entry) {
+      delete conversionProgress[chartNumber];
+    }
   }, 300000);
 }
 
@@ -80,13 +86,16 @@ export function setConversionFailed(chartNumber: string, message: string): void 
 // as a failure, instead of deleting it the instant it succeeds — otherwise
 // the next poll sees the job vanish before the "Done" message is ever read.
 export function setConversionCompleted(chartNumber: string, message: string): void {
-  conversionProgress[chartNumber] = {
+  const entry: ConversionProgress = {
     status: 'completed',
     message,
     log: conversionProgress[chartNumber]?.log ?? []
   };
+  conversionProgress[chartNumber] = entry;
   setTimeout(() => {
-    delete conversionProgress[chartNumber];
+    if (conversionProgress[chartNumber] === entry) {
+      delete conversionProgress[chartNumber];
+    }
   }, 300000);
 }
 
