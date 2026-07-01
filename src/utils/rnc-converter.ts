@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import unzipper from 'unzipper';
-import { makeContainerWritableDir } from './container-fs.js';
+import { makeContainerWritableDir, withOutputChmod } from './container-fs.js';
 import { CHARTS_TOOLBOX_IMAGE } from './container-images.js';
 import {
   ensureImage as ensureContainerImage,
@@ -69,21 +69,8 @@ async function extractZip(zipPath: string, targetDir: string): Promise<string[]>
   return allFiles;
 }
 
-// The toolbox image's helper tools (gdal_translate, gdaladdo, …) all run as
-// the image's fixed UID, so whatever they write lands owned by that UID
-// with owner-only write. The host SignalK process is commonly a different
-// UID and can't write the file afterward — e.g. the post-conversion
-// metadata patch (setMbtilesType below) fails with "attempt to write a
-// readonly database". Appending a `chmod` to the same container
-// invocation fixes this at the source, while the container is still
-// running as the owning UID.
-function withOutputChmod(argv: readonly string[], outputContainerPath: string): string[] {
-  const sq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
-  const script = ['set -e', argv.map(sq).join(' '), `chmod 666 ${sq(outputContainerPath)}`].join(
-    '\n'
-  );
-  return ['bash', '-c', script];
-}
+// `withOutputChmod` lives in container-fs.ts so both converters share one copy
+// — see the import at the top of this file.
 
 function appendLog(chartNumber: string, text: string): void {
   if (!chartNumber || !text) {
@@ -141,18 +128,25 @@ export async function convertKapToMbtiles(
     ? `/output/${resolved['/output'].subPath}`
     : '/output';
 
+  const containerOutput = `${outputPrefix}/${baseName}.mbtiles`;
   const result = await runContainerJob({
     image: CHARTS_TOOLBOX_IMAGE,
     label: `gdal-translate-${chartNumber || baseName}`,
-    command: [
-      'gdal_translate',
-      '-of',
-      'MBTiles',
-      '-co',
-      'TILE_FORMAT=PNG',
-      `${inputPrefix}/${path.basename(kapFile)}`,
-      `${outputPrefix}/${baseName}.mbtiles`
-    ],
+    // chmod on this mandatory step so the file is host-writable for any later
+    // metadata patch, even when the optional addOverviews/gdaladdo step fails
+    // (its withOutputChmod is skipped by `set -e` on a non-zero exit).
+    command: withOutputChmod(
+      [
+        'gdal_translate',
+        '-of',
+        'MBTiles',
+        '-co',
+        'TILE_FORMAT=PNG',
+        `${inputPrefix}/${path.basename(kapFile)}`,
+        containerOutput
+      ],
+      containerOutput
+    ),
     inputs: { '/input': resolved['/input'].source },
     outputs: { '/output': resolved['/output'].source },
     // Single-process GDAL stage; one core is enough.
@@ -322,15 +316,24 @@ export async function processRncZip(
       const translateResult = await runContainerJob({
         image: CHARTS_TOOLBOX_IMAGE,
         label: `gdal-translate-${baseName}`,
-        command: [
-          'gdal_translate',
-          '-of',
-          'MBTiles',
-          '-co',
-          'TILE_FORMAT=PNG',
-          containerInput,
+        // chmod the output here, on the mandatory step that creates the file —
+        // not only on the optional gdaladdo overview step below. gdaladdo
+        // failure is tolerated (a warning, then we still patch metadata via
+        // setMbtilesType), and its withOutputChmod is skipped by `set -e` when
+        // the tool fails — which would leave the file 0o644 and the patch
+        // failing with "attempt to write a readonly database".
+        command: withOutputChmod(
+          [
+            'gdal_translate',
+            '-of',
+            'MBTiles',
+            '-co',
+            'TILE_FORMAT=PNG',
+            containerInput,
+            containerOutput
+          ],
           containerOutput
-        ],
+        ),
         inputs: { '/input': resolved['/input'].source },
         outputs: { '/output': resolved['/output'].source },
         // Single-process GDAL stage; one core is enough.
@@ -548,15 +551,21 @@ export async function processPilotTar(
       const translateResult = await runContainerJob({
         image: CHARTS_TOOLBOX_IMAGE,
         label: `gdal-translate-${baseName}`,
-        command: [
-          'gdal_translate',
-          '-of',
-          'MBTiles',
-          '-co',
-          'TILE_FORMAT=PNG',
-          containerInput,
+        // chmod on this mandatory step (see processRncZip above) so the file is
+        // host-writable even when the optional gdaladdo overview step fails and
+        // its withOutputChmod is skipped by `set -e`.
+        command: withOutputChmod(
+          [
+            'gdal_translate',
+            '-of',
+            'MBTiles',
+            '-co',
+            'TILE_FORMAT=PNG',
+            containerInput,
+            containerOutput
+          ],
           containerOutput
-        ],
+        ),
         inputs: { '/input': convResolved['/input'].source },
         outputs: { '/output': convResolved['/output'].source },
         // Single-process GDAL stage; one core is enough.

@@ -30,7 +30,12 @@ function throwIfJobCancelled(result: { status?: string }): void {
 }
 import { sanitizeChartFilename } from './catalog-title.js';
 import { getCpuBudget } from './concurrency.js';
-import { makeContainerWritable, makeContainerWritableDir } from './container-fs.js';
+import {
+  makeContainerWritable,
+  makeContainerWritableDir,
+  shellQuote,
+  withOutputChmod
+} from './container-fs.js';
 import { CHARTS_TOOLBOX_IMAGE } from './container-images.js';
 import {
   ensureImage as ensureContainerImage,
@@ -675,27 +680,9 @@ function buildLayerManifest(
   );
 }
 
-// Single-quote a string for the shell so paths/flags with spaces or
-// metacharacters survive word-splitting intact as one argv element.
-const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
-
-// The toolbox image's helper tools (tippecanoe, gdaladdo, tile-join, …) all
-// run as the image's fixed UID, so whatever they write lands owned by that
-// UID with owner-only write. The host SignalK process is commonly a
-// different UID and can't write the file afterward — e.g. the
-// post-conversion metadata patch fails with "attempt to write a readonly
-// database". Appending a `chmod` to the same container invocation fixes
-// this at the source, while the container is still running as the owning
-// UID, instead of the host trying (and failing) to reclaim write access
-// after the fact.
-function withOutputChmod(argv: readonly string[], outputContainerPath: string): string[] {
-  const script = [
-    'set -e',
-    argv.map(shellQuote).join(' '),
-    `chmod 666 ${shellQuote(outputContainerPath)}`
-  ].join('\n');
-  return ['bash', '-c', script];
-}
+// `shellQuote` and `withOutputChmod` live in container-fs.ts (next to
+// makeContainerWritable, the rest of the toolbox-UID permission story) so both
+// converters share one copy — see the imports at the top of this file.
 
 // Build the tippecanoe invocation as a small `bash -c` script that reads the
 // `-L` layer pairs from the manifest at runtime, instead of inlining them into
